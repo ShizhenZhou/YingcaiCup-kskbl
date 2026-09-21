@@ -1,0 +1,5 @@
+# 运行环境：ROCK 5B+ / Radxa OS (Debian 12) / Python 3.11 (aarch64)
+# 系统依赖：sudo apt install -y libportaudio2
+numpy==2.4.6
+sounddevice==0.5.6
+pyserial==3.5

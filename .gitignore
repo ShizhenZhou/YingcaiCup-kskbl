@@ -1,0 +1,44 @@
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============ 本项目的运行产物 ============
+# 音频素材体积大，且可能含录音隐私
+*.wav
+*.raw
+*.flac
+audio/
+recordings/
+
+# ============ 镜像 / 固件（体积巨大）============
+*.img
+*.img.xz
+*.iso
+
+# ============ 本地私密文件（本仓库公开，这些永不提交）============
+*.local.md
+*.local.json
+LOCAL_*
+secrets.*
+*.key
+*.pem
+*.p12
+*.keystore
+
+# ============ 编辑器 / 系统 ============
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ============ 日志 ============
+*.log
