@@ -14,6 +14,12 @@
     python3 screen_bringup.py --mode gradient    # 只跑渐变
     python3 screen_bringup.py --mode text        # 只跑文字（带四角定位块）
 
+    # 显示一张图片（默认 cover：等比放大盖满屏幕，居中裁边）
+    python3 screen_bringup.py --mode image --image ~/Desktop/kobe.png
+
+    # 不想被裁就用 contain（完整放入，四周留黑边）
+    python3 screen_bringup.py --mode image --image ~/Desktop/kobe.png --fit contain
+
     # 花屏 / 雪花时降速重试
     python3 screen_bringup.py --speed 4000000
 
@@ -31,6 +37,7 @@
     gradient  : 从左上(红)过渡到右下(蓝)，平滑无断层
     text      : 四角有 红/绿/蓝/白 四个小方块，中间有中文
                 四角方块缺一个 → 画面偏移，调 --rowstart / --colstart
+    image     : 显示指定图片。cover 满屏 / contain 留黑边，都是等比缩放
 """
 
 import argparse
@@ -260,6 +267,59 @@ def test_text(lcd, speed_hz=None):
     print("  → 英文变方块 = 字体不含拉丁字形（别用 DroidSansFallback）")
 
 
+# ── 测试 5：图片显示 ─────────────────────────────────────────
+def make_image(path, width, height, fit="cover"):
+    """把任意图片缩放/裁切成屏幕尺寸，返回 RGB565 缓冲。
+
+    fit="cover"   : 等比放大到盖满屏幕，多出来的部分居中裁掉。
+                    照片首选 —— 满屏无黑边，代价是裁掉一点边缘。
+    fit="contain" : 等比缩小到完整放进屏幕，四周留黑边。
+                    不裁掉任何内容，代价是画面变小、有黑边。
+
+    ⚠️ 两种都是**等比**缩放，绝不会把人拉扁或拉长。
+    """
+    from PIL import Image
+
+    from kskbl.st7789 import image_to_565_bytes
+
+    img = Image.open(path).convert("RGB")
+    src_w, src_h = img.size
+
+    if fit == "cover":
+        scale = max(width / src_w, height / src_h)
+    else:
+        scale = min(width / src_w, height / src_h)
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    if fit == "cover":
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        img = img.crop((left, top, left + width, top + height))
+        note = "居中裁掉多余部分"
+    else:
+        canvas = Image.new("RGB", (width, height), (12, 12, 12))
+        canvas.paste(img, ((width - new_w) // 2, (height - new_h) // 2))
+        img = canvas
+        note = "完整放入，四周留黑边"
+
+    print("  原图 %d x %d  →  等比缩放到 %d x %d  →  %s，%s"
+          % (src_w, src_h, new_w, new_h, fit, note))
+    return image_to_565_bytes(img)
+
+
+def test_image(lcd, path, fit="cover"):
+    banner("图片显示")
+    if not os.path.exists(path):
+        print("  ❌ 找不到文件：%s" % path)
+        return
+    print("  文件：%s" % path)
+    push(lcd, make_image(path, lcd.width, lcd.height, fit), "图片 (%s)" % fit)
+    print("\n  → 人被拉扁/拉长 = 绝对不该发生（这里都是等比缩放）")
+    print("  → 头顶被切掉一截 = 改用 --fit contain 看完整图")
+
+
 # ── 主流程 ───────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
@@ -269,8 +329,13 @@ def main():
     ap.add_argument(
         "--mode",
         default="all",
-        choices=["all", "solid", "bars", "gradient", "text"],
+        choices=["all", "solid", "bars", "gradient", "text", "image"],
         help="跑哪个测试（默认 all）",
+    )
+    ap.add_argument("--image", default=None, help="--mode image 时要显示的图片路径")
+    ap.add_argument(
+        "--fit", default="cover", choices=["cover", "contain"],
+        help="图片缩放方式：cover = 满屏裁边（默认），contain = 完整放入留黑边",
     )
     ap.add_argument(
         "--speed", type=int, default=10_000_000,
@@ -324,6 +389,11 @@ def main():
             time.sleep(2.0)
         if args.mode in ("all", "text"):
             test_text(lcd, args.speed)
+        if args.mode == "image":
+            if not args.image:
+                print("\n  ⚠️  --mode image 需要同时指定 --image <图片路径>")
+            else:
+                test_image(lcd, args.image, args.fit)
 
         banner("完成")
         print("  最后一个图案会留在屏上（脚本退出时不会清屏）")
