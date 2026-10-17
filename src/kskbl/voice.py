@@ -222,6 +222,84 @@ def pitch_shift(x, sr=None, semitones=0.0, n_fft=1024):
 # ══════════════════════════════════════════════════════════════
 # 变声器
 # ══════════════════════════════════════════════════════════════
+def formant_shift(x, sr, ratio, n_fft=1024, hop=None, lifter=40):
+    """**只移动共振峰，音高不变。**
+
+    ratio > 1 → 共振峰整体上移 → 声道"变小" → 更年轻 / 更卡通 / 更甜
+    ratio < 1 → 共振峰下移 → 更粗、更沉、更成熟
+
+    为什么需要单独一步：
+        音高（基频）决定"音有多高"，
+        共振峰（频谱包络）决定"音色像谁"。
+        只升调不搬共振峰 = 花栗鼠；只搬共振峰不升调 = 换了个人的嗓子。
+        两者独立可控，才能精确模仿某个声音。
+
+    原理（倒谱包络搬移）：
+        1. 分帧 STFT，取对数幅度谱
+        2. 求倒谱（log 谱的逆变换）。
+           倒谱低阶 = 频谱包络（共振峰），高阶 = 基频谐波的纹波
+        3. 用 lifter 把高阶截掉 → 得到**平滑包络**
+        4. 把包络在频率轴上拉伸 ratio 倍
+        5. 新幅度谱 = 原幅度谱 × (新包络 / 旧包络)，相位保持不变
+        6. 逆变换 + 重叠相加
+    """
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0 or ratio == 1.0:
+        return x.copy()
+
+    if hop is None:
+        hop = n_fft // 4
+
+    win = np.hanning(n_fft).astype(np.float32)
+    pad = n_fft
+    xp = np.concatenate([np.zeros(pad, dtype=np.float32), x,
+                         np.zeros(pad, dtype=np.float32)])
+
+    n_frames = 1 + max(0, (len(xp) - n_fft) // hop)
+    if n_frames < 1:
+        return x.copy()
+
+    n_bins = n_fft // 2 + 1
+    # 包络在频率轴上的取样位置：新位置 k 取旧包络的 k/ratio 处
+    src_idx = np.arange(n_bins, dtype=np.float64) / ratio
+    src_idx = np.clip(src_idx, 0, n_bins - 1)
+
+    out = np.zeros(n_fft + n_frames * hop, dtype=np.float32)
+    lifter = max(1, min(lifter, n_fft // 2 - 1))
+
+    for i in range(n_frames):
+        start = i * hop
+        frame = xp[start:start + n_fft] * win
+        spec = np.fft.rfft(frame)
+        mag = np.abs(spec)
+        phase = np.angle(spec)
+
+        # 对数幅度谱 → 倒谱 → lifter 截断 → 回到对数包络
+        logmag = np.log(mag + 1e-8)
+        cep = np.fft.irfft(logmag, n_fft)
+        cep_l = cep.copy()
+        cep_l[lifter:n_fft - lifter] = 0.0
+        env = np.exp(np.fft.rfft(cep_l, n_fft).real)
+
+        # 包络在频率轴上搬移
+        new_env = np.interp(src_idx, np.arange(n_bins, dtype=np.float64), env)
+
+        gain = new_env / (env + 1e-8)
+        new_mag = mag * gain
+
+        y = np.fft.irfft(new_mag * np.exp(1j * phase), n_fft)
+        out[start:start + n_fft] += (y * win).astype(np.float32)
+
+    # 分析窗 × 合成窗 补偿
+    out /= (float(np.sum(win ** 2)) / hop)
+
+    # 去掉补零
+    out = out[pad:pad + len(x)]
+    if len(out) < len(x):
+        out = np.concatenate([out, np.zeros(len(x) - len(out), dtype=np.float32)])
+    return out.astype(np.float32)
+
+
 # ══════════════════════════════════════════════════════════════
 # 预设音效
 # ══════════════════════════════════════════════════════════════
@@ -243,21 +321,24 @@ PRESETS = {
     # 共振峰也放大到 4.3 倍，听感非常尖，属于夸张玩具音（备选）
     "wawa_oct": 25.24,
 
-    # 曼波音备选：280 Hz（试听轨迹上偏中间的一档）
+    # 曼波音：**按实测素材校准**（2026-10-17）
     #
-    # 调参轨迹（每一步都是用户听过后给出的相对调整）：
-    #   +13.24 (257Hz) → 升8度 +25.24 (485Hz) → 降4 → +21.24 (387Hz)
-    #   → 降4 → +17.24 (310Hz) → 降2 → +15.24 (280Hz)
-    #   最后横向对比 5 个预设，选回 +13.24。
-    "manbo": 15.24,
+    # 素材：曼波：哥我求你了…（31 s / 44.1 kHz / 64 kbps）
+    #   实测 F0 = 352.8 Hz，有声帧 80%
+    #   源（本机麦克风）F0 = 118.7 Hz
+    #   差值 = 12×log2(352.8/118.7) = +18.86 半音
+    #
+    # 复现方法：
+    #   voice.py <你的声音.wav> --target <曼波素材.wav>
+    "manbo": 18.86,
 }
 
 PRESET_LABELS = {
     "natural": "自然女声 184Hz",
     "cartoon": "卡通高音 229Hz",
-    "wawa": "瓦瓦音 257Hz ★",
+    "wawa": "瓦瓦音 257Hz",
     "wawa_oct": "尖锐版 485Hz",
-    "manbo": "曼波备选 280Hz",
+    "manbo": "曼波音 353Hz ★",
 }
 
 
@@ -272,14 +353,19 @@ class VoiceChanger(object):
         peak_dbfs : 归一化目标峰值
     """
 
-    def __init__(self, semitones=6.0, highpass=80.0, gate_db=-55.0,
-                 normalize=True, peak_dbfs=-4.0, n_fft=1024):
+    def __init__(self, semitones=6.0, formant_semitones=None, highpass=80.0,
+                 gate_db=-55.0, normalize=True, peak_dbfs=-4.0, n_fft=1024,
+                 lifter=40):
         self.semitones = semitones
+        # 共振峰单独搬移量。None = 跟音高同步（耦合，默认行为）
+        self.formant_semitones = (semitones if formant_semitones is None
+                                  else formant_semitones)
         self.highpass = highpass
         self.gate_db = gate_db
         self.normalize = normalize
         self.peak_dbfs = peak_dbfs
         self.n_fft = n_fft
+        self.lifter = lifter
 
     @classmethod
     def from_preset(cls, name, **kwargs):
@@ -356,8 +442,16 @@ class VoiceChanger(object):
         if x.ndim > 1:
             x = x.mean(axis=1)
 
-        # ① 变调 + 共振峰搬移
+        # ① 音高 + 共振峰按同一比例搬移（时间拉伸 + 重采样）
         out = pitch_shift(x, sr, semitones=self.semitones, n_fft=self.n_fft)
+
+        # ② 共振峰补偿 —— 让共振峰可以独立于音高
+        #    例如：音高要升 18.86 半音，但共振峰只该升 12 半音，
+        #    这里就把多搬出来的 6.86 半音拉回来。
+        extra = self.formant_semitones - self.semitones
+        if abs(extra) > 1e-6:
+            out = formant_shift(out, sr, semitones_to_ratio(extra),
+                                n_fft=self.n_fft, lifter=self.lifter)
 
         # ② 高通：滤波声和低频隆隆
         if self.highpass and self.highpass > 0:
@@ -604,6 +698,48 @@ def compare_presets(path, save_dir="/tmp"):
     return 0
 
 
+def shift_one(path, semitones, formant=None, out_path=None, play=False,
+              peak_dbfs=-4.0):
+    """对单个 wav 按指定参数变声（可独立指定音高与共振峰）"""
+    import time
+    import soundfile as sf
+
+    data, sr = sf.read(path, dtype="float32")
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+
+    before = analyze(data, sr)
+
+    vc = VoiceChanger(semitones=semitones, formant_semitones=formant,
+                      gate_db=None, normalize=True, peak_dbfs=peak_dbfs)
+    out = vc.process(data, sr)
+
+    after = analyze(out, sr)
+
+    if out_path is None:
+        out_path = "/tmp/shift_%d_%d.wav" % (int(round(semitones * 100)),
+                                             int(round((formant if formant is not None else semitones) * 100)))
+    sf.write(out_path, out, sr)
+
+    print("  音高     %+.2f 半音 → F0 %.1f Hz（原来 %.1f）"
+          % (semitones, after["f0"], before["f0"]))
+    if formant is not None:
+        print("  共振峰   %+.2f 半音（%s）"
+              % (formant,
+                 "与音高同步" if abs(formant - semitones) < 1e-6
+                 else "独立设置"))
+    print("  输出     %s" % out_path)
+
+    if play:
+        try:
+            import kskbl.audio as audio
+            audio.play_wav(out_path, device=audio.find_alsa_device("output"))
+        except Exception as exc:  # noqa: BLE001
+            print("  （播放失败：%s）" % exc)
+
+    return 0
+
+
 def main():
     """没有参数时跑纯音自检；给了 wav 路径就做基频分析。"""
     import argparse
@@ -621,7 +757,17 @@ def main():
     ap.add_argument("--target", default=None, help="目标声音 wav，用来算变调半音数")
     ap.add_argument("--compare", action="store_true",
                     help="对第一个 wav 套用所有预设并逐个播放（演示/调参用）")
+    ap.add_argument("--shift", type=float, default=None,
+                    help="变调半音数（与 --formant 配合做单次处理）")
+    ap.add_argument("--formant", type=float, default=None,
+                    help="共振峰搬移半音数；不填则与 --shift 同步")
+    ap.add_argument("--play", action="store_true", help="处理完直接播放")
+    ap.add_argument("--out", default=None, help="输出 wav 路径")
     args = ap.parse_args()
+
+    if args.shift is not None and args.files:
+        return shift_one(args.files[0], args.shift, args.formant,
+                         out_path=args.out, play=args.play)
 
     if args.compare and args.files:
         return compare_presets(args.files[0])
