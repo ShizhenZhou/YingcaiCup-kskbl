@@ -1,5 +1,69 @@
 # 运行环境：ROCK 5B+ / Radxa OS (Debian 12) / Python 3.11 (aarch64)
-# 系统依赖：sudo apt install -y libportaudio2
-numpy==2.4.6
+
+# ══════════════════════════════════════════════════════════════
+# 一、系统依赖（apt 装，不是 pip）
+# ══════════════════════════════════════════════════════════════
+#   sudo apt install -y \
+#        python3-libgpiod python3-spidev python3-pil python3-numpy \
+#        python3-rknnlite2 libportaudio2 fonts-noto-cjk
+#
+#   python3-libgpiod  屏幕 DC/RES 的 GPIO 控制
+#   python3-spidev    SPI（屏幕数据传输）
+#   python3-pil       画字画图
+#   python3-rknnlite2 NPU 推理（MeloTTS 解码器）—— **只能 apt 装**
+#   libportaudio2     sounddevice 的底层
+#   fonts-noto-cjk    屏幕显示中英文（别用 DroidSansFallback，它不含拉丁字母）
+
+# ══════════════════════════════════════════════════════════════
+# 二、venv 必须能看到系统包
+# ══════════════════════════════════════════════════════════════
+# rknnlite / spidev / gpiod / PIL 都是 apt 包，venv 默认看不到。
+# 加一个 .pth 即可（等价于 python3 -m venv --system-site-packages）：
+#
+#   echo /usr/lib/python3/dist-packages \
+#     > ~/proj/venv/lib/python3.11/site-packages/system-packages.pth
+
+# ══════════════════════════════════════════════════════════════
+# 三、pip 依赖
+# ══════════════════════════════════════════════════════════════
+
+# ── 通用 ──────────────────────────────────────────────
+# numpy 固定在 1.x：onnxruntime / sherpa-onnx 的稳定组合
+numpy==1.26.4
 sounddevice==0.5.6
 pyserial==3.5
+
+# ── 语音识别（SenseVoice）─────────────────────────────
+# 官方提供 manylinux2014_aarch64 轮子
+sherpa-onnx==1.13.8
+
+# ── 语音合成（MeloTTS-RKNN2）──────────────────────────
+onnxruntime==1.31.0
+soundfile==0.14.0
+cn2an==0.5.24
+pypinyin==0.55.0
+jieba==0.42.1
+num2words==0.5.14
+inflect==7.5.0
+
+# ── 模型下载 ──────────────────────────────────────────
+huggingface_hub
+
+# ══════════════════════════════════════════════════════════════
+# 四、模型文件（不放进 git）
+# ══════════════════════════════════════════════════════════════
+#   ~/proj/models/sense_voice/
+#       model.int8.onnx    228 MB   ← HuggingFace: csukuangfj/sherpa-onnx-sense-voice-...-2024-07-17
+#       tokens.txt
+#       test_wavs/
+#
+#   ~/proj/MeloTTS-RKNN2/
+#       encoder.onnx        30 MB
+#       decoder.rknn        78 MB
+#       g.bin  lexicon.txt  tokens.txt  melotts_rknn.py  text/  english_utils/  utils.py
+#       ← HuggingFace: happyme531/MeloTTS-RKNN2  (AGPL-3.0)
+#
+# ⚠️ 下载注意事项（详见 docs/AI语音链路_可行性验证.md）：
+#   * GitHub Releases 在校园网下**下不动大文件**，请用 hf-mirror.com
+#   * 下 HF 大文件必须设 HF_HUB_DISABLE_XET=1，否则报 401
+#   * 板子上没有 git-lfs，**不要 git clone** HF 仓库
