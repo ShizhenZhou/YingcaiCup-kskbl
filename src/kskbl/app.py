@@ -52,6 +52,7 @@ from kskbl.asr import Recognizer                          # noqa: E402
 from kskbl.render import screens                          # noqa: E402
 from kskbl.st7789 import ST7789                           # noqa: E402
 from kskbl.tts import Synthesizer                         # noqa: E402
+from kskbl.voice import PRESETS, PRESET_LABELS, VoiceChanger  # noqa: E402
 
 
 # 状态常量
@@ -112,6 +113,16 @@ class App(object):
             print("  MeloTTS 加载完成，%.2f s" % (time.time() - t0))
         else:
             print("\n[4/4] 跳过语音合成（--no-tts）")
+
+        # ── 变声器 ──（纯 numpy，加载是瞬时的）
+        if args.voice == "off":
+            self.vc = None
+            self.voice_label = "关闭"
+        else:
+            self.vc = VoiceChanger.from_preset(args.voice)
+            self.voice_label = PRESET_LABELS.get(args.voice, args.voice)
+            print("\n🎛  变声预设：%s（%+.2f 半音）"
+                  % (self.voice_label, PRESETS[args.voice]))
 
     # ── 屏幕 ───────────────────────────────────────────────
     def show(self, buf):
@@ -246,12 +257,35 @@ class App(object):
         return r
 
     def process(self, samples, result):
-        """处理阶段 —— **变声 DSP 以后接在这里**
+        """处理阶段 —— 变声 DSP
 
-        现在直接返回原始波形，等变声做好后在这里做 DSP：
-            return self.voice_changer.process(samples)
+        用 --voice 选预设：natural / cartoon / wawa / manbo / off
         """
-        return samples
+        if self.vc is None:
+            return samples
+
+        self.show(self.screens.busy("变声处理中…", self.voice_label))
+        print("🎛  变声：%s" % self.voice_label)
+        t0 = time.time()
+        out = self.vc.process(samples, audio.RECORD_RATE)
+        print("  变声耗时 %.2f s" % (time.time() - t0))
+        return out
+
+    def play_changed(self, samples, result):
+        """把变声后的声音放出来 —— 这是演示的重点"""
+        import soundfile as sf
+
+        out = self.args.voice_out
+        sf.write(out, samples, audio.RECORD_RATE)
+
+        self.show(self.screens.text_page(
+            "变声效果",
+            (result.text or "") + "\n\n听一下这个声音",
+            footer="预设：%s" % self.voice_label,
+            title_color=(255, 180, 100),
+        ))
+        print("🔊 播放变声结果…")
+        audio.play_wav(out, device=audio.find_alsa_device("output"))
 
     def reply(self, result):
         """生成回应文本"""
@@ -347,10 +381,15 @@ class App(object):
                     ))
                     time.sleep(self.args.result_hold)
 
-                    # 处理（变声以后接这里）
+                    # 处理（变声）
                     processed = self.process(samples, result)
 
-                    # 回应
+                    # 先播变声效果 —— 这是演示的重点
+                    if self.vc is not None:
+                        self.play_changed(processed, result)
+                        time.sleep(0.6)
+
+                    # 再用 TTS 回应
                     if self.tts is not None:
                         self.speak(self.reply(result))
 
@@ -405,6 +444,11 @@ def main():
     ap.add_argument("--reply", default="echo", choices=["echo", "fixed"],
                     help="回应方式：echo=复述识别文本，fixed=固定一句话")
     ap.add_argument("--no-tts", action="store_true", help="不做语音合成（只识别）")
+    ap.add_argument("--voice", default="wawa",
+                    choices=sorted(PRESETS.keys()) + ["off"],
+                    help="变声预设（默认 wawa；off = 不变声）")
+    ap.add_argument("--voice-out", default="/tmp/app_voice.wav",
+                    help="变声结果的输出 wav")
     ap.add_argument("--tts-out", default="/tmp/app_tts.wav", help="TTS 输出文件")
     ap.add_argument("--tts-peak", type=float, default=-4.0,
                     help="TTS 归一化目标峰值 dBFS（默认 -4，数值越小越轻）")
