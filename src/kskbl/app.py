@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""主状态机 —— 把屏幕、录音、语音识别、语音合成串成一个完整链路
+
+────────────────────────────────────────────────────────
+流程
+────────────────────────────────────────────────────────
+    待机 IDLE
+       ↓ 触发（自动循环 / 3.5mm 插孔 / 回车）
+    录音 LISTENING     屏幕显示音量条
+       ↓
+    识别 THINKING      屏幕显示「识别中…」
+       ↓
+    展示 RESULT        屏幕显示识别出来的文字
+       ↓
+    回应 SPEAKING      TTS 合成 + 播放，屏幕显示回复
+       ↓
+    回到待机
+
+────────────────────────────────────────────────────────
+⚠️ 这一步故意**还没做变声**
+────────────────────────────────────────────────────────
+    先把「说完 → 认出来 → 回一句」这条链路跑通，
+    变声 DSP 是下一步。格式上给变声预留了位置（见 process()）。
+
+────────────────────────────────────────────────────────
+用法
+────────────────────────────────────────────────────────
+    # 自动循环（最省事，适合无人值守测试）
+    python3 src/kskbl/app.py --trigger auto --cycles 3
+
+    # 插 3.5mm 插头触发（板子自己的 ES8316 孔，现在空着）
+    python3 src/kskbl/app.py --trigger jack
+
+    # 听完就退出，不做回应（只看识别效果）
+    python3 src/kskbl/app.py --trigger auto --cycles 1 --no-tts
+
+    python3 src/kskbl/app.py --help
+"""
+
+import argparse
+import os
+import sys
+import time
+
+# 允许直接用 python3 src/kskbl/app.py 运行（而不只是 python -m kskbl.app）
+if __package__ in (None, ""):  # pragma: no cover
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+import kskbl.audio as audio                              # noqa: E402
+from kskbl.asr import Recognizer                          # noqa: E402
+from kskbl.render import screens                          # noqa: E402
+from kskbl.st7789 import ST7789                           # noqa: E402
+from kskbl.tts import Synthesizer                         # noqa: E402
+
+
+# 状态常量
+IDLE = "idle"
+LISTENING = "listening"
+THINKING = "thinking"
+RESULT = "result"
+SPEAKING = "speaking"
+ERROR = "error"
+
+
+class App(object):
+    def __init__(self, args):
+        self.args = args
+        self.state = IDLE
+
+        print("=" * 62)
+        print("  会听会变声的智能终端 —— 语音链路状态机")
+        print("=" * 62)
+
+        # ── 屏幕 ──
+        print("\n[1/4] 初始化屏幕")
+        self.lcd = ST7789(speed_hz=args.speed, width=240, height=240)
+        self.lcd.init()
+        self.screens = screens
+        print("  SPI %.1f MHz，尺寸 %dx%d" % (args.speed / 1e6,
+                                             self.lcd.width, self.lcd.height))
+
+        # ── 音频设备 ──
+        print("\n[2/4] 准备音频设备")
+        self.card = audio.find_usb_card_index()
+        if self.card is None:
+            raise SystemExit("❌ 找不到 USB 声卡")
+
+        audio.setup_mic_gain(self.card, gain=args.mic_gain)
+        audio.setup_speaker(self.card, volume=args.speaker_volume)
+
+        self.dev_in = audio.find_sounddevice_index("input")
+        if self.dev_in is None:
+            raise SystemExit("❌ 找不到 USB 声卡的录音设备")
+
+        self.recorder = audio.Recorder(device=self.dev_in, rate=audio.RECORD_RATE)
+        print("  ALSA 卡号 %d | 录音设备索引 %s | %d Hz 单声道"
+              % (self.card, self.dev_in, audio.RECORD_RATE))
+        print("  麦克风增益 %d/35，扬声器音量 %d/37" % (args.mic_gain, args.speaker_volume))
+
+        # ── AI 模型 ──
+        print("\n[3/4] 加载语音识别模型")
+        t0 = time.time()
+        self.asr = Recognizer(num_threads=args.asr_threads)
+        print("  SenseVoice 加载完成，%.2f s" % self.asr.load_elapsed)
+
+        self.tts = None
+        if not args.no_tts:
+            print("\n[4/4] 加载语音合成模型")
+            t0 = time.time()
+            self.tts = Synthesizer()
+            print("  MeloTTS 加载完成，%.2f s" % (time.time() - t0))
+        else:
+            print("\n[4/4] 跳过语音合成（--no-tts）")
+
+    # ── 屏幕 ───────────────────────────────────────────────
+    def show(self, buf):
+        self.lcd.show(buf)
+
+    def show_error(self, message, detail=""):
+        self.state = ERROR
+        self.show(self.screens.error(message, detail))
+        print("  ⚠️  %s  %s" % (message, detail))
+
+    # ── 触发 ───────────────────────────────────────────────
+    def wait_trigger(self):
+        """等一次触发。返回 True 表示该开工了。"""
+        if self.args.trigger == "auto":
+            time.sleep(self.args.gap)
+            return True
+
+        if self.args.trigger == "jack":
+            return self._wait_jack()
+
+        if self.args.trigger == "enter":
+            try:
+                input("\n按回车开始一轮（Ctrl+C 退出）… ")
+                return True
+            except EOFError:
+                return False
+
+        raise SystemExit("未知触发方式：%s" % self.args.trigger)
+
+    def _wait_jack(self):
+        """等 3.5mm 插孔插入（板子自己的 ES8316，card 3）
+
+        实机验证：/dev/input/event8 上报 SW_HEADPHONE_INSERT
+        """
+        import select
+        import struct
+
+        EVENT_FMT = struct.Struct("llHHi")
+        EV_SW = 0x05
+        SW_HEADPHONE_INSERT = 0x02
+
+        event_path = self.args.jack_event
+        if not os.path.exists(event_path):
+            raise SystemExit("❌ 找不到插孔事件设备 %s" % event_path)
+
+        fd = os.open(event_path, os.O_RDONLY)
+        print("\n等待 3.5mm 插孔触发（插一下就开始）…")
+        self.show(self.screens.idle("插入 3.5mm 插头", footer="等待触发"))
+
+        buf = b""
+        try:
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0.3)
+                if not ready:
+                    continue
+                buf += os.read(fd, EVENT_FMT.size * 32)
+                hit = False
+                while len(buf) >= EVENT_FMT.size:
+                    _, _, etype, code, value = EVENT_FMT.unpack_from(buf, 0)
+                    buf = buf[EVENT_FMT.size:]
+                    if etype == EV_SW and code == SW_HEADPHONE_INSERT and value == 1:
+                        hit = True
+                if hit:
+                    return True
+        finally:
+            os.close(fd)
+
+    # ── 一轮认知 ───────────────────────────────────────────
+    def listen(self):
+        """录音阶段，返回 float32 波形"""
+        self.state = LISTENING
+        levels = []
+
+        hint = "请说话，%d 秒…" % self.args.duration
+
+        # ── 给用户明确的「开始说话」信号 ──
+        # 3 声倒数的嘀（800Hz），最后一声长音（1400Hz）就是"开始说"。
+        # 没有提示音的话，人根本不知道什么时候该说（实测踩过这个坑：
+        # 前几次录音全是环境噪声，ASR 还因此编出一段通顺的假话）。
+        out_dev = audio.find_alsa_device("output")
+        for i in (3, 2, 1):
+            self.show(self.screens.busy("准备录音…", "倒数 %d —— 待会儿听到长音就开始说" % i))
+            audio.beep(times=1, freq=800, duration=0.15, volume=0.5, device=out_dev)
+            time.sleep(0.85)
+
+        self.show(self.screens.listening(levels, hint=hint))
+        audio.beep(times=1, freq=1400, duration=0.35, volume=0.6, device=out_dev)
+        print("\n🔔 长音已响 —— 现在开始说话（%d 秒）！" % self.args.duration)
+
+        def on_level(ratio, progress):
+            levels.append(ratio)
+            if len(levels) > 64:
+                del levels[:-64]
+            self.show(self.screens.listening(levels, hint=hint))
+
+        print("\n🎤 录音 %.1f 秒…" % self.args.duration)
+        t0 = time.time()
+        samples = self.recorder.record(self.args.duration,
+                                       level_cb=on_level, tick=0.12)
+        # 两声低音 = 录音结束
+        audio.beep(times=2, freq=520, duration=0.12, volume=0.5, device=out_dev)
+        print("🔔 提示音：录音结束")
+        print("  录到 %.2f 秒" % (len(samples) / audio.RECORD_RATE))
+
+        # 统计电平
+        import math
+
+        peak = float(abs(samples).max()) if len(samples) else 0.0
+        rms = float((samples ** 2).mean() ** 0.5) if len(samples) else 0.0
+        peak_db = 20 * math.log10(peak) if peak > 0 else -999.0
+        rms_db = 20 * math.log10(rms) if rms > 0 else -999.0
+        print("  峰值 %.1f dBFS | RMS %.1f dBFS | 峰值-RMS 差 %.1f dB"
+              % (peak_db, rms_db, peak_db - rms_db))
+
+        # 存盘便于事后分析
+        if self.args.save_wav:
+            import soundfile as sf
+            sf.write(self.args.save_wav, samples, audio.RECORD_RATE)
+            print("  已存到 %s" % self.args.save_wav)
+
+        return samples
+
+    def recognize(self, samples):
+        """识别阶段"""
+        self.state = THINKING
+        self.show(self.screens.busy("识别中…", "SenseVoice"))
+        print("🧠 识别中…")
+        r = self.asr.recognize(samples, audio.RECORD_RATE)
+        print("  耗时 %.3f s | %.1f 倍速 | 语种 %s" % (
+            r.elapsed, r.realtime_factor, r.lang))
+        print("  识别文字: %s" % (r.text or "(空)"))
+        return r
+
+    def process(self, samples, result):
+        """处理阶段 —— **变声 DSP 以后接在这里**
+
+        现在直接返回原始波形，等变声做好后在这里做 DSP：
+            return self.voice_changer.process(samples)
+        """
+        return samples
+
+    def reply(self, result):
+        """生成回应文本"""
+        text = (result.text or "").strip()
+        if not text:
+            return "我没有听清楚，请再说一遍。"
+
+        if self.args.reply == "fixed":
+            return "我听到了。"
+
+        # 默认：回声式，证明识别和合成两端都通
+        prefix = "你说的是："
+        body = text.rstrip("。.!？?")
+        return prefix + body + "。"
+
+    def speak(self, text):
+        """合成并播放"""
+        if self.tts is None:
+            return None
+
+        self.state = SPEAKING
+        self.show(self.screens.busy("正在回应…", "合成中"))
+
+        out = self.args.tts_out
+        info = self.tts.say(text, path=out, play=False,
+                            peak_dbfs=self.args.tts_peak)
+
+        # 播放时把文字显示出来
+        self.show(self.screens.text_page(
+            "回应",
+            text,
+            footer="%.1f s 音频  %.1f 倍速"
+                   % (info["duration"],
+                      (info["duration"] / info["synth_elapsed"])
+                      if info["synth_elapsed"] else 0),
+            title_color=(120, 230, 160),
+        ))
+        audio.play_wav(out, device=audio.find_alsa_device("output"))
+
+        print("🔊 播放回应：%s" % text)
+        return info
+
+    # ── 主循环 ─────────────────────────────────────────────
+    def run(self):
+        self.show(self.screens.idle("待机中", footer="触发方式：%s" % self.args.trigger))
+        print("\n" + "=" * 62)
+        print("  ✅ 就绪，屏幕已显示待机画面")
+        print("=" * 62)
+
+        cycle = 0
+        try:
+            while True:
+                if self.args.cycles and cycle >= self.args.cycles:
+                    print("\n已跑满 %d 轮，结束" % self.args.cycles)
+                    break
+
+                if not self.wait_trigger():
+                    break
+                cycle += 1
+                print("\n" + "─" * 62)
+                print("第 %d 轮" % cycle)
+                print("─" * 62)
+
+                try:
+                    samples = self.listen()
+                    result = self.recognize(samples)
+
+                    text = (result.text or "").strip()
+                    # 去掉标点后为空 = 根本没识别到语音
+                    # （ASR 在低信噪比下经常只回一个「.」，此时不能拿去做 TTS，
+                    #   否则会合成出「你说的是：。」这种没有内容的句子）
+                    if len(text.strip(" .。,，!！?？…、;；:：")) == 0:
+                        print("  （识别结果只有标点，按「无语音」处理）")
+                        self.show_error("没有识别到语音",
+                                        "听到长音提示后立刻说话，声音大一点")
+                        time.sleep(2.0)
+                        last = getattr(self, "last_text", "")
+                        self.show(self.screens.idle(
+                            "待机中",
+                            footer=("上次：" + last[:26]) if last
+                            else "AI 语音链路就绪"))
+                        continue
+
+                    # 显示识别结果
+                    self.state = RESULT
+                    self.last_text = text
+                    self.show(self.screens.text_page(
+                        "我听到了",
+                        text,
+                        footer="%.2f s 识别  %.0f 倍速  %s"
+                               % (result.elapsed, result.realtime_factor,
+                                  result.lang.strip("<|>")),
+                    ))
+                    time.sleep(self.args.result_hold)
+
+                    # 处理（变声以后接这里）
+                    processed = self.process(samples, result)
+
+                    # 回应
+                    if self.tts is not None:
+                        self.speak(self.reply(result))
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    import traceback
+                    traceback.print_exc()
+                    self.show_error("出错了", "%s: %s" % (type(exc).__name__, exc))
+                    time.sleep(2.0)
+
+                # 回到待机，把上次识别的文字留在屏幕底部
+                last = getattr(self, "last_text", "")
+                self.show(self.screens.idle(
+                    "待机中",
+                    footer=("上次：" + last[:26]) if last else "AI 语音链路就绪"))
+
+        except KeyboardInterrupt:
+            print("\n\n收到 Ctrl+C，退出中…")
+        finally:
+            self.close()
+
+    def close(self):
+        print("清理资源…")
+        try:
+            self.lcd.close()
+        except Exception:
+            pass
+        for name in ("asr", "tts"):
+            obj = getattr(self, name, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        print("已退出")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="语音链路状态机：待机 → 录音 → 识别 → 回应",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--trigger", default="auto",
+                    choices=["auto", "jack", "enter"],
+                    help="触发方式（默认 auto 自动循环）")
+    ap.add_argument("--gap", type=float, default=1.0, help="auto 模式下每轮间隔秒数")
+    ap.add_argument("--cycles", type=int, default=0, help="跑几轮后结束（0=一直跑）")
+    ap.add_argument("--duration", type=float, default=4.0, help="每次录音时长（秒）")
+    ap.add_argument("--result-hold", type=float, default=1.5,
+                    help="识别结果显示停留时间（秒）")
+    ap.add_argument("--reply", default="echo", choices=["echo", "fixed"],
+                    help="回应方式：echo=复述识别文本，fixed=固定一句话")
+    ap.add_argument("--no-tts", action="store_true", help="不做语音合成（只识别）")
+    ap.add_argument("--tts-out", default="/tmp/app_tts.wav", help="TTS 输出文件")
+    ap.add_argument("--tts-peak", type=float, default=-4.0,
+                    help="TTS 归一化目标峰值 dBFS（默认 -4，数值越小越轻）")
+    ap.add_argument("--save-wav", default=None,
+                    help="把每次录音存到这个 wav（调试用）")
+    ap.add_argument("--mic-gain", type=int, default=25, help="麦克风增益 0~35（默认 25）")
+    ap.add_argument("--speaker-volume", type=int, default=37, help="扬声器音量 0~37")
+    ap.add_argument("--speed", type=int, default=30_000_000, help="SPI 时钟 Hz")
+    ap.add_argument("--asr-threads", type=int, default=4, help="ASR 线程数")
+    ap.add_argument("--jack-event", default="/dev/input/event8",
+                    help="jack 模式下的插孔事件设备")
+    args = ap.parse_args()
+
+    App(args).run()
+
+
+if __name__ == "__main__":
+    main()

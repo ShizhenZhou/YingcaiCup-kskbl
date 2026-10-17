@@ -269,11 +269,12 @@ class Synthesizer(object):
         return np.asarray(audio, dtype=np.float32)
 
     @staticmethod
-    def normalize(audio, peak_dbfs=-1.0):
+    def normalize(audio, peak_dbfs=-4.0):
         """峰值归一化到指定 dBFS。
 
-        模型原始输出峰值约 -18 dBFS，听起来偏小；
-        归一化到 -1 dBFS 大约加 17 dB。
+        模型原始输出峰值约 -18 dBFS，听起来偏小。
+        归一化目标默认 **-4 dBFS**：比满量程留 4 dB 余量，
+        实测比 -1 dBFS 更耐听（-1 在音箱上会觉得偏吵）。
         """
         a = np.asarray(audio, dtype=np.float32)
         if a.size == 0:
@@ -300,7 +301,7 @@ class Synthesizer(object):
         return device
 
     def say(self, text, path=None, play=False, normalize=True,
-            peak_dbfs=-1.0, speed=None):
+            peak_dbfs=-4.0, speed=None):
         """一步到位：合成 →（归一化）→（存盘）→（播放）
 
         返回 dict：audio / path / synth_elapsed / duration
