@@ -64,6 +64,7 @@
 
 import argparse
 import os
+import re
 import select
 import struct
 import subprocess
@@ -83,14 +84,38 @@ DEFAULT_IMAGE = "/home/radxa/Desktop/kobe.png"
 
 # 耳机插入检测
 JACK_EVENT = "/dev/input/event8"
-JACK_CARD = 4
-JACK_NUMID = 38          # Headphone Jack
+JACK_CARD = None          # None = 自动按名字找（⚠️ 声卡号会漂移，绝不能写死）
+JACK_NUMID = 38           # Headphone Jack
+JACK_CARD_KEY = "es8316"  # 在 /proc/asound/cards 里匹配的卡名关键字
 
 # ── Linux input 子系统常量 ────────────────────────────────────
 EV_SW = 0x05
 SW_HEADPHONE_INSERT = 0x02
 # struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
 EVENT_FMT = struct.Struct("llHHi")
+
+
+# ── 声卡定位 ─────────────────────────────────────────────────
+def find_card_index(keyword=JACK_CARD_KEY):
+    """从 /proc/asound/cards 里找出名字含 keyword 的声卡编号。
+
+    ⚠️ 为什么要这么麻烦：**声卡号会漂移**。
+       实测同一块板子重启几次，ES8316 的卡号在 4 → 3 → 2 之间变过。
+       写死 -c 4 的话，某次重启后就会报 "Cannot find the given element"。
+
+    /proc/asound/cards 的格式：
+         3 [rockchipes8316 ]: rockchip-es8316 - rockchip-es8316
+        ↑编号  ↑卡 ID              ↑驱动名          ↑设备名
+    """
+    try:
+        with open("/proc/asound/cards") as fh:
+            for line in fh:
+                match = re.match(r"\s*(\d+)\s+\[([^\]]*)\]", line)
+                if match and keyword.lower() in line.lower():
+                    return int(match.group(1))
+    except OSError:
+        pass
+    return None
 
 
 # ── 耳机插孔监听 ─────────────────────────────────────────────
@@ -118,21 +143,43 @@ class JackWatcher(object):
                 "   然后重新登录（重开一个 SSH 会话）再试。\n" % event
             )
 
-    def current_state(self):
-        """读 ALSA 插孔状态：True=已插入，False=未插入，None=读不到"""
+    def _read_card(self, card):
+        """对指定卡号读一次插孔状态；成功返回 True/False，失败返回 None"""
         try:
-            out = subprocess.run(
-                ["amixer", "-c", str(self.card), "cget", "numid=%d" % JACK_NUMID],
+            proc = subprocess.run(
+                ["amixer", "-c", str(card), "cget", "numid=%d" % JACK_NUMID],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 timeout=2.0,
-            ).stdout.decode("utf-8", "replace")
+            )
         except Exception:
             return None
-        for line in out.splitlines():
+        if proc.returncode != 0:
+            return None
+        for line in proc.stdout.decode("utf-8", "replace").splitlines():
             line = line.strip()
             if line.startswith(": values="):
                 return line.split("=", 1)[1].strip() == "on"
+        return None
+
+    def current_state(self):
+        """读 ALSA 插孔状态：True=已插入，False=未插入，None=读不到
+
+        卡号可能是自动检测来的，也可能在运行期间变过 ——
+        所以读失败时会**重新按名字找一次卡号再重试**。
+        """
+        if self.card is None:
+            self.card = find_card_index()
+
+        if self.card is not None:
+            state = self._read_card(self.card)
+            if state is not None:
+                return state
+
+        detected = find_card_index()
+        if detected is not None and detected != self.card:
+            self.card = detected
+            return self._read_card(detected)
         return None
 
     def wait(self, timeout):
@@ -216,7 +263,7 @@ def test_jack(event, card):
     print("  耳机插孔测试")
     print("=" * 62)
     print("  事件设备: %s" % event)
-    print("  声卡    : card %d" % card)
+    print("  声卡    : %s" % ("自动检测" if card is None else "card %d" % card))
 
     jack = JackWatcher(event=event, card=card)
     state = jack.current_state()
@@ -254,7 +301,8 @@ def main():
     ap.add_argument("--mp3", default=DEFAULT_MP3, help="要播放的 mp3")
     ap.add_argument("--image", default=DEFAULT_IMAGE, help="播放时显示的图片")
     ap.add_argument("--event", default=JACK_EVENT, help="耳机插孔输入事件设备")
-    ap.add_argument("--card", type=int, default=JACK_CARD, help="声卡号（读 ALSA 插孔状态用）")
+    ap.add_argument("--card", type=int, default=JACK_CARD,
+                    help="声卡号；不填则自动按名字找 es8316（推荐，卡号会漂移）")
     ap.add_argument("--speed", type=int, default=30_000_000, help="SPI 时钟 Hz（默认 30MHz）")
     ap.add_argument("--test-jack", action="store_true", help="只测插拔，不初始化屏幕和音频")
     args = ap.parse_args()
@@ -272,7 +320,8 @@ def main():
     print("=" * 62)
     print("  音乐 : %s" % os.path.basename(args.mp3))
     print("  图片 : %s" % os.path.basename(args.image))
-    print("  插孔 : %s (card %d)" % (args.event, args.card))
+    print("  插孔 : %s（%s）"
+          % (args.event, "声卡自动检测" if args.card is None else "card %d" % args.card))
     print("  SPI  : %.1f MHz" % (args.speed / 1e6))
 
     print("\n[1/3] 打开耳机插孔检测")
