@@ -46,7 +46,15 @@
     out = vc.pitch_shift(samples, 48000, semitones=6)
 """
 
+import os
+
 import numpy as np
+
+# 允许直接用 python3 src/kskbl/voice.py 运行（这样 import kskbl.audio 才找得到）
+if __package__ in (None, ""):  # pragma: no cover
+    import sys as _sys
+
+    _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -226,19 +234,30 @@ PRESETS = {
     # 卡通高音：实测 F0 203.4 Hz，偏高但不尖锐
     "cartoon": 10.0,
 
-    # 瓦瓦音：实测 F0 242.4 Hz —— 和 MeloTTS 中文默认女声（242.3 Hz）同高
+    # ★ 瓦瓦音：**最终选定**（2026-10-17 试听对比后确定）
+    #   源 F0 118.7 Hz → 输出实测 256.7 Hz
+    #   5 个预设横向对比里听感最好的一档：够卡通、又还听得出说的是什么
     "wawa": 13.24,
 
-    # 曼波音：**占位值，待按参考素材校准**
-    # 拿到素材后用 voice.py --target <素材.wav> 算出准确半音数再替换
-    "manbo": 13.24,
+    # 尖锐版：在瓦瓦音基础上再升一个八度 → 约 485 Hz
+    # 共振峰也放大到 4.3 倍，听感非常尖，属于夸张玩具音（备选）
+    "wawa_oct": 25.24,
+
+    # 曼波音备选：280 Hz（试听轨迹上偏中间的一档）
+    #
+    # 调参轨迹（每一步都是用户听过后给出的相对调整）：
+    #   +13.24 (257Hz) → 升8度 +25.24 (485Hz) → 降4 → +21.24 (387Hz)
+    #   → 降4 → +17.24 (310Hz) → 降2 → +15.24 (280Hz)
+    #   最后横向对比 5 个预设，选回 +13.24。
+    "manbo": 15.24,
 }
 
 PRESET_LABELS = {
-    "natural": "自然女声",
-    "cartoon": "卡通高音",
-    "wawa": "瓦瓦音",
-    "manbo": "曼波音（待校准）",
+    "natural": "自然女声 184Hz",
+    "cartoon": "卡通高音 229Hz",
+    "wawa": "瓦瓦音 257Hz ★",
+    "wawa_oct": "尖锐版 485Hz",
+    "manbo": "曼波备选 280Hz",
 }
 
 
@@ -358,8 +377,8 @@ class VoiceChanger(object):
 # ══════════════════════════════════════════════════════════════
 # 基频分析与音色匹配
 # ══════════════════════════════════════════════════════════════
-def estimate_f0(x, sr, fmin=70.0, fmax=500.0, frame_ms=40.0, hop_ms=20.0,
-                voicing_threshold=0.30, silence_db=-45.0):
+def estimate_f0(x, sr, fmin=70.0, fmax=1000.0, frame_ms=40.0, hop_ms=20.0,
+                voicing_threshold=0.30, silence_db=-45.0, subharm_tol=0.85):
     """估计基频（自相关法）。
 
     返回 (中位基频 Hz, 有声帧比例)
@@ -411,12 +430,28 @@ def estimate_f0(x, sr, fmin=70.0, fmax=500.0, frame_ms=40.0, hop_ms=20.0,
         if hi <= lag_min:
             continue
         region = ac[lag_min:hi]
-        if region.size == 0:
+        if region.size < 3:
             continue
 
-        peak = int(np.argmax(region)) + lag_min
-        if ac[peak] < voicing_threshold:
+        # ⚠️ 关键：自相关在 2×、3× 周期处也有峰，直接取最大值会选到次谐波
+        #    （实测：800 Hz 的纯音被估计成 400 Hz）。
+        #    做法：先取全局最大，再在"高度足够的局部极大"里选**延迟最小**的那个，
+        #    也就是取最短周期 = 最高的基频。
+        best = float(region.max())
+        if best < voicing_threshold:
             continue
+
+        chosen = None
+        floor = best * subharm_tol
+        for j in range(1, len(region) - 1):
+            v = region[j]
+            if v >= floor and v >= region[j - 1] and v >= region[j + 1]:
+                chosen = j
+                break
+        if chosen is None:
+            chosen = int(np.argmax(region))
+
+        peak = chosen + lag_min
 
         f0s.append(sr / float(peak))
 
@@ -522,6 +557,53 @@ def analyze_files(paths, target_path=None):
     return 0
 
 
+def compare_presets(path, save_dir="/tmp"):
+    """把同一个声音依次套用所有预设并播放 —— 演示和调参时用。
+
+    演示场景：说同一句话，一路听 242Hz → 280Hz → 310Hz → 387Hz → 485Hz，
+    屏幕可以同步显示当前预设，观众能直接感受到"变调量"的作用。
+    """
+    import time
+    import soundfile as sf
+
+    data, sr = sf.read(path, dtype="float32")
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+
+    info = analyze(data, sr)
+    print("=" * 68)
+    print("  预设对比：%s" % path)
+    print("  源 F0 ≈ %.1f Hz | 时长 %.2f s" % (info["f0"], info["duration"]))
+    print("=" * 68)
+
+    try:
+        import kskbl.audio as audio
+        dev = audio.find_alsa_device("output")
+        can_play = True
+    except Exception as exc:  # noqa: BLE001
+        print("  （无法播放：%s）" % exc)
+        can_play = False
+
+    for name in PRESETS:
+        vc = VoiceChanger.from_preset(name, gate_db=None,
+                                      normalize=True, peak_dbfs=-4.0)
+        out = vc.process(data, sr)
+        out_path = os.path.join(save_dir, "compare_%s.wav" % name)
+        sf.write(out_path, out, sr)
+
+        r = analyze(out, sr)
+        print("  %-10s %+6.2f 半音 → F0 %6.1f Hz   %s"
+              % (name, PRESETS[name], r["f0"], PRESET_LABELS.get(name, "")))
+
+        if can_play:
+            audio.play_wav(out_path, device=dev)
+            time.sleep(0.45)
+
+    print("=" * 68)
+    print("  文件都在 %s/compare_*.wav" % save_dir)
+    return 0
+
+
 def main():
     """没有参数时跑纯音自检；给了 wav 路径就做基频分析。"""
     import argparse
@@ -537,7 +619,12 @@ def main():
     )
     ap.add_argument("files", nargs="*", help="要分析的 wav 文件")
     ap.add_argument("--target", default=None, help="目标声音 wav，用来算变调半音数")
+    ap.add_argument("--compare", action="store_true",
+                    help="对第一个 wav 套用所有预设并逐个播放（演示/调参用）")
     args = ap.parse_args()
+
+    if args.compare and args.files:
+        return compare_presets(args.files[0])
 
     if args.files or args.target:
         paths = list(args.files)
