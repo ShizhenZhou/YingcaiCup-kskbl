@@ -196,8 +196,38 @@ def level_to_ratio(rms):
 # ══════════════════════════════════════════════════════════════
 # 录音
 # ══════════════════════════════════════════════════════════════
+def trim_silence(x, rate, threshold=0.01, keep=0.3):
+    """剪掉首尾的静音，两端各保留 keep 秒余量。
+
+    静音自动停会在句尾留下约 3 秒空白，对识别没有帮助，
+    还会让 ASR 多处理一截噪声。剪掉后识别速度和准确率都会好一点。
+    """
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0:
+        return x
+
+    loud = np.abs(x) > threshold
+    if not loud.any():
+        return x
+
+    first = int(np.argmax(loud))
+    last = len(loud) - int(np.argmax(loud[::-1]))
+
+    margin = int(rate * keep)
+    start = max(0, first - margin)
+    end = min(len(x), last + margin)
+    return x[start:end]
+
+
 class Recorder(object):
-    """固定时长的阻塞录音，期间可以通过回调拿到实时电平。"""
+    """阻塞录音。支持两种结束方式：
+
+    * **固定时长** —— 只给 seconds，录满就停（原来的行为）
+    * **静音自动停** —— 给 silence_stop（秒）。检测到说话之后，
+      连续静音超过这个时长就提前结束；seconds 此时是**上限**（保险用）。
+
+    录音期间可以通过 level_cb 拿到实时电平画音量条。
+    """
 
     def __init__(self, device=None, rate=RECORD_RATE, channels=RECORD_CHANNELS,
                  block=1024):
@@ -205,12 +235,21 @@ class Recorder(object):
         self.rate = rate
         self.channels = channels
         self.block = block
+        # 上一次录音的统计信息（时长、结束原因、有声/静音累计）
+        self.last_info = {}
 
-    def record(self, seconds, level_cb=None, tick=0.08):
-        """录 seconds 秒，返回 float32 单声道数组。
+    def record(self, seconds, level_cb=None, tick=0.08, silence_stop=None,
+               speech_threshold=0.18, min_speech=0.2):
+        """录一段音频，返回 float32 单声道数组。
 
-        level_cb(level_ratio, progress)  每 tick 秒被调用一次（**在主线程里**），
-        level_ratio 已经是 0~1，progress 是 0~1 的进度。
+        参数
+            seconds          : 最长录音时长（秒）。有 silence_stop 时是上限
+            level_cb         : level_cb(level_ratio, progress) 每 tick 调一次
+            tick             : 轮询间隔（秒）
+            silence_stop     : 连续静音超过这么多秒就停；None = 录满固定时长
+            speech_threshold : 电平比例超过这个值算"有人在说话"（0~1）
+            min_speech       : 至少累积这么久的有声段，才开始计静音，
+                               否则开头还没开口就会被判定成"静音"
         """
         frames = int(seconds * self.rate)
         if frames <= 0:
@@ -226,7 +265,10 @@ class Recorder(object):
             chunk = indata[:n, 0].copy()
             buf[state["pos"]:state["pos"] + n] = chunk
             state["pos"] += n
-            state["level"] = float(np.sqrt(np.mean(chunk * chunk)))
+            rms = float(np.sqrt(np.mean(chunk * chunk)))
+            # 平滑一下：单块（约 21 ms）的电平抖动很大，
+            # 直接用会让"说话中的正常换气"被误判成静音。
+            state["level"] = 0.75 * state["level"] + 0.25 * rms
 
         stream = sd.InputStream(
             samplerate=self.rate,
@@ -237,18 +279,45 @@ class Recorder(object):
             callback=callback,
         )
 
-        t_end = time.monotonic() + seconds
+        t0 = time.monotonic()
+        t_end = t0 + seconds
+        spoken = 0.0      # 累计有声时长
+        silent = 0.0      # 当前连续静音时长
+        reason = "录满上限"
+
         with stream:
             while True:
                 now = time.monotonic()
                 if now >= t_end:
+                    reason = "已录满 %.1f 秒上限" % seconds
                     break
+
+                ratio = level_to_ratio(state["level"])
+                if ratio >= speech_threshold:
+                    spoken += tick
+                    silent = 0.0
+                elif spoken >= min_speech:
+                    # 只有真的开过口，才开始累计静音
+                    silent += tick
+
                 if level_cb is not None:
-                    progress = 1.0 - max(0.0, (t_end - now) / seconds)
-                    level_cb(level_to_ratio(state["level"]), progress)
+                    level_cb(ratio, min(1.0, (now - t0) / seconds))
+
+                if (silence_stop and spoken >= min_speech
+                        and silent >= silence_stop):
+                    reason = "静音 %.1f 秒，自动结束" % silent
+                    break
+
                 time.sleep(tick)
 
-        return buf[:state["pos"]]
+        n = state["pos"]
+        self.last_info = {
+            "duration": n / float(self.rate),
+            "reason": reason,
+            "spoken": spoken,
+            "silent": silent,
+        }
+        return buf[:n]
 
 
 # ══════════════════════════════════════════════════════════════

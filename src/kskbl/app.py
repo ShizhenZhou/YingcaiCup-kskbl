@@ -71,14 +71,14 @@ ERROR = "error"
 # 说「我是瓦瓦」→ 切到瓦瓦音色（DSP 波形变声）
 #
 # ⚠️ ASR 对这两个名字的识别**非常不稳定**，实测收到的写法有：
-#      「我是慢播」「我是漫播」「我是娃娃」「我是哇哇」
-#    "曼"同音字有 曼/慢/漫/满， "波"同音字有 波/播/拨/博，
-#    穷举是 4×4=16 种组合，而且以后还会遇到新的。
+#      「我是慢播」「我是漫播」「我是漫步」「我是娃娃」「我是哇哇」
+#    "曼"同音字有 曼/慢/漫/满/蛮， "波"同音字有 波/播/拨/博/步，
+#    穷举是 5×5=25 种组合，而且以后还会遇到新的。
 #
 #    所以改用**字符类正则**：只要相邻两个字符分别落在同音字集合里就算命中。
 #    不要求"我是"前缀（句子里出现这个词就当成指令）。
 _VOICE_PATTERNS = [
-    ("manbo", re.compile("[曼慢漫满蛮][波播拨博簸]")),
+    ("manbo", re.compile("[曼慢漫满蛮蔓][波播拨博簸步]")),
     ("wawa", re.compile("[瓦娃哇挖袜][瓦娃哇挖袜]")),
 ]
 
@@ -260,7 +260,11 @@ class App(object):
         self.state = LISTENING
         levels = []
 
-        hint = "请说话，%d 秒…" % self.args.duration
+        # 有静音自动停时，时长上限只是保险；否则是固定录音时长
+        if self.args.silence_stop and self.args.silence_stop > 0:
+            hint = "说完停顿 %d 秒自动结束" % int(self.args.silence_stop)
+        else:
+            hint = "请说话，%d 秒…" % self.args.duration
 
         # ── 给用户明确的「开始说话」信号 ──
         # 3 声倒数的嘀（800Hz），最后一声长音（1400Hz）就是"开始说"。
@@ -274,7 +278,11 @@ class App(object):
 
         self.show(self.screens.listening(levels, hint=hint))
         audio.beep(times=1, freq=1400, duration=0.35, volume=0.6, device=out_dev)
-        print("\n🔔 长音已响 —— 现在开始说话（%d 秒）！" % self.args.duration)
+        if self.args.silence_stop and self.args.silence_stop > 0:
+            print("\n🔔 长音已响 —— 现在开始说话（说完停顿 %.1f 秒自动结束，最多 %.1f 秒）！"
+                  % (self.args.silence_stop, self.args.duration))
+        else:
+            print("\n🔔 长音已响 —— 现在开始说话（%.1f 秒）！" % self.args.duration)
 
         def on_level(ratio, progress):
             levels.append(ratio)
@@ -282,14 +290,21 @@ class App(object):
                 del levels[:-64]
             self.show(self.screens.listening(levels, hint=hint))
 
-        print("\n🎤 录音 %.1f 秒…" % self.args.duration)
+        print("🎤 录音中…")
         t0 = time.time()
-        samples = self.recorder.record(self.args.duration,
-                                       level_cb=on_level, tick=0.12)
+        samples = self.recorder.record(
+            self.args.duration, level_cb=on_level, tick=0.12,
+            silence_stop=self.args.silence_stop or None)
+        info = getattr(self.recorder, "last_info", {})
+
         # 两声低音 = 录音结束
         audio.beep(times=2, freq=520, duration=0.12, volume=0.5, device=out_dev)
         print("🔔 提示音：录音结束")
-        print("  录到 %.2f 秒" % (len(samples) / audio.RECORD_RATE))
+        raw_len = len(samples) / audio.RECORD_RATE
+        samples = audio.trim_silence(samples, audio.RECORD_RATE)
+        print("  录到 %.2f 秒（%s），裁掉首尾静音后 %.2f 秒"
+              % (raw_len, info.get("reason", "?"),
+                 len(samples) / audio.RECORD_RATE))
 
         # 统计电平
         import math
@@ -570,7 +585,10 @@ def main():
                     help="触发方式（默认 auto 自动循环）")
     ap.add_argument("--gap", type=float, default=1.0, help="auto 模式下每轮间隔秒数")
     ap.add_argument("--cycles", type=int, default=0, help="跑几轮后结束（0=一直跑）")
-    ap.add_argument("--duration", type=float, default=4.0, help="每次录音时长（秒）")
+    ap.add_argument("--duration", type=float, default=15.0,
+                    help="最长录音时长（秒）。有 --silence-stop 时是上限")
+    ap.add_argument("--silence-stop", type=float, default=3.0,
+                    help="说完后停顿多少秒自动结束录音（默认 3；0 = 关闭，用固定时长）")
     ap.add_argument("--result-hold", type=float, default=1.5,
                     help="识别结果显示停留时间（秒）")
     ap.add_argument("--reply", default="echo", choices=["echo", "fixed"],
