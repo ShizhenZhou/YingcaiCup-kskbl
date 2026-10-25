@@ -95,45 +95,37 @@ VOICE_ALIASES = [
 ]
 
 # ── 关机指令 ──────────────────────────────────────────────
-# 「关机」只有两个字，ASR 很容易在别的句子里误命中，
-# 一旦误触发板子就断电了。所以采取**整句严格匹配**：
-#   去掉标点后，整句必须正好等于"关机"（可以带礼貌前后缀）。
-#   像「我要关机充电」「关机键在哪」这种**不会**触发。
-SHUTDOWN_WORDS = ("关机", "关闭机器", "关掉机器", "关闭系统")
-SHUTDOWN_PREFIXES = ("请", "帮我", "可以", "麻烦", "快", "现在")
-SHUTDOWN_SUFFIXES = ("吧", "了", "啦", "谢谢", "一下", "吧谢谢")
+# ⚠️ 关机是破坏性操作，误触发就等于演示时板子突然断电。
+#    所以要求**先说对当前音色名 + 关机**：
+#        当前是曼波 → 必须说「曼波关机」
+#        当前是瓦瓦 → 必须说「瓦瓦关机」
+#    光说「关机」**不会**关机 —— 这样误命中的概率极低。
+#
+# 音色名同样做同音容错（ASR 实测会把"曼波"识别成"慢播/漫播/漫步"）：
+#   [曼慢漫满蛮蔓] × [波播拨博簸步] + [关關] + [机機]
+_SHUTDOWN_PATTERNS = {
+    "manbo": re.compile("[曼慢漫满蛮蔓][波播拨博簸步][关關][机機]"),
+    "wawa": re.compile("[瓦娃哇挖袜][瓦娃哇挖袜][关關][机機]"),
+}
 
 
-def detect_shutdown_command(text):
-    """检测是否在要求关机。只有整句表达这个意思才返回 True。
+def detect_shutdown_command(text, voice):
+    """检测是否在要求关机。**必须说对当前音色名才算**。
 
-    >>> detect_shutdown_command("关机")        -> True
-    >>> detect_shutdown_command("关机吧！")     -> True
-    >>> detect_shutdown_command("请关机")      -> True
-    >>> detect_shutdown_command("我要关机充电") -> False
-    >>> detect_shutdown_command("关机键在哪")   -> False
+    参数 voice 是当前音色名（manbo / wawa）。换音色后关机词也跟着换。
+
+    >>> detect_shutdown_command("曼波关机", "manbo")   -> True
+    >>> detect_shutdown_command("慢播关机", "manbo")   -> True
+    >>> detect_shutdown_command("瓦瓦关机", "manbo")   -> False
+    >>> detect_shutdown_command("关机", "manbo")       -> False
+    >>> detect_shutdown_command("瓦瓦关机", "wawa")    -> True
+    >>> detect_shutdown_command("曼波关机", "wawa")    -> False
     """
-    if not text:
+    if not text or voice not in _SHUTDOWN_PATTERNS:
         return False
 
     flat = "".join(text.split())
-    flat = flat.strip(" .,。，!！?？…、;；:：\"'")
-
-    # 反复剥掉礼貌前后缀，最后必须正好剩下一个关机词
-    for _ in range(3):
-        changed = False
-        for p in SHUTDOWN_PREFIXES:
-            if flat.startswith(p) and len(flat) > len(p):
-                flat = flat[len(p):]
-                changed = True
-        for s in SHUTDOWN_SUFFIXES:
-            if flat.endswith(s) and len(flat) > len(s):
-                flat = flat[:-len(s)]
-                changed = True
-        if not changed:
-            break
-
-    return flat in SHUTDOWN_WORDS
+    return bool(_SHUTDOWN_PATTERNS[voice].search(flat))
 
 
 # 这些音色走 CosyVoice 音色克隆（文字→语音），其余走 DSP 波形变声
@@ -599,9 +591,9 @@ class App(object):
                         continue
 
                     # ── 关机指令 ──
-                    # 必须整句表达关机才触发（「我要关机充电」不会命中），
-                    # 见 detect_shutdown_command 的说明。
-                    if detect_shutdown_command(text):
+                    # 必须说对**当前音色名**才算：「曼波关机」/「瓦瓦关机」。
+                    # 光说「关机」不会触发，见 detect_shutdown_command。
+                    if detect_shutdown_command(text, self.current_voice):
                         self.shutdown()
                         return
 
