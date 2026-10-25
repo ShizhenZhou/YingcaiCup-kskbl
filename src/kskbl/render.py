@@ -286,6 +286,26 @@ class Screens(object):
 
         return to_buffer(img)
 
+    def plain(self, text, size=20, center=True):
+        """**只显示一段文字** —— 没有标题、页脚、卡片或装饰。
+
+        演示时用这个把识别到的话直接打在屏幕上，干净利落。
+        文字过长会自动换行，行数过多时垂直居中并截断。
+        """
+        img, d = new_canvas(width=self.width, height=self.height)
+        f = font(size)
+        pad = 16
+        x0, x1 = pad, self.width - pad
+        y0, y1 = pad, self.height - pad
+
+        if center:
+            lines = wrap_text(d, text, f, x1 - x0)
+            total_h = len(lines) * (f.size + 3)
+            y0 = pad + max(0, (self.height - 2 * pad - total_h) // 2)
+
+        _draw_text_block(d, text, (x0, y0, x1, y1), f, FG)
+        return to_buffer(img)
+
     # ── 错误 ─────────────────────────────────────────────
     def error(self, message, detail=""):
         img, d = new_canvas(width=self.width, height=self.height)

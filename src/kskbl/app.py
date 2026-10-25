@@ -40,6 +40,7 @@
 
 import argparse
 import os
+import re
 import sys
 import time
 
@@ -51,6 +52,7 @@ import kskbl.audio as audio                              # noqa: E402
 from kskbl.asr import Recognizer                          # noqa: E402
 from kskbl.render import screens                          # noqa: E402
 from kskbl.st7789 import ST7789                           # noqa: E402
+from kskbl.cosy import CosyVoice                        # noqa: E402
 from kskbl.tts import Synthesizer                         # noqa: E402
 from kskbl.voice import PRESETS, PRESET_LABELS, VoiceChanger  # noqa: E402
 
@@ -62,6 +64,64 @@ THINKING = "thinking"
 RESULT = "result"
 SPEAKING = "speaking"
 ERROR = "error"
+
+
+# ── 语音切换音色的指令 ────────────────────────────────────────
+# 说「我是曼波」→ 切到曼波音色（CosyVoice 音色克隆）
+# 说「我是瓦瓦」→ 切到瓦瓦音色（DSP 波形变声）
+#
+# ⚠️ ASR 对这两个名字的识别**非常不稳定**，实测收到的写法有：
+#      「我是慢播」「我是漫播」「我是娃娃」「我是哇哇」
+#    "曼"同音字有 曼/慢/漫/满， "波"同音字有 波/播/拨/博，
+#    穷举是 4×4=16 种组合，而且以后还会遇到新的。
+#
+#    所以改用**字符类正则**：只要相邻两个字符分别落在同音字集合里就算命中。
+#    不要求"我是"前缀（句子里出现这个词就当成指令）。
+_VOICE_PATTERNS = [
+    ("manbo", re.compile("[曼慢漫满蛮][波播拨博簸]")),
+    ("wawa", re.compile("[瓦娃哇挖袜][瓦娃哇挖袜]")),
+]
+
+# 同义词（整个梗的其他叫法）
+VOICE_ALIASES = [
+    ("manbo", ("哈基米",)),
+]
+
+
+# 这些音色走 CosyVoice 音色克隆（文字→语音），其余走 DSP 波形变声
+COSSY_VOICES = ("manbo",)
+
+VOICE_LABELS = {
+    "manbo": "曼波音色",
+    "wawa": "瓦瓦音色",
+    "wawo_oct": "尖锐版",
+    "natural": "自然女声",
+    "cartoon": "卡通高音",
+    "off": "不变声",
+}
+
+
+def detect_voice_command(text):
+    """从识别文本里找语音切换指令，返回音色名或 None。
+
+    用同音字字符类匹配，容忍 ASR 把"曼波"识别成"慢播/漫播"之类。
+
+    >>> detect_voice_command("我是慢播。")    -> "manbo"
+    >>> detect_voice_command("我是漫播。")    -> "manbo"
+    >>> detect_voice_command("我是娃娃。")    -> "wawa"
+    >>> detect_voice_command("今天天气不错")  -> None
+    """
+    if not text:
+        return None
+    flat = "".join(text.split())
+    for name, pattern in _VOICE_PATTERNS:
+        if pattern.search(flat):
+            return name
+    for name, words in VOICE_ALIASES:
+        for word in words:
+            if word in flat:
+                return name
+    return None
 
 
 class App(object):
@@ -105,24 +165,28 @@ class App(object):
         self.asr = Recognizer(num_threads=args.asr_threads)
         print("  SenseVoice 加载完成，%.2f s" % self.asr.load_elapsed)
 
+        # ── 语音合成（MeloTTS）──
+        # 现在不再用 TTS 复述识别结果（改成直接播变声后的声音），
+        # 所以默认**不加载** MeloTTS —— 能省 8 秒启动时间。
+        # 需要时加 --tts 启用。
         self.tts = None
-        if not args.no_tts:
+        if args.tts:
             print("\n[4/4] 加载语音合成模型")
             t0 = time.time()
             self.tts = Synthesizer()
             print("  MeloTTS 加载完成，%.2f s" % (time.time() - t0))
         else:
-            print("\n[4/4] 跳过语音合成（--no-tts）")
+            print("\n[4/4] 跳过语音合成（默认不加载，需要时加 --tts）")
 
-        # ── 变声器 ──（纯 numpy，加载是瞬时的）
-        if args.voice == "off":
-            self.vc = None
-            self.voice_label = "关闭"
-        else:
-            self.vc = VoiceChanger.from_preset(args.voice)
-            self.voice_label = PRESET_LABELS.get(args.voice, args.voice)
-            print("\n🎛  变声预设：%s（%+.2f 半音）"
-                  % (self.voice_label, PRESETS[args.voice]))
+        # ── 变声器 / 音色克隆引擎 ──
+        # 两套引擎，用 switch_voice() 统一切换：
+        #   DSP 预设（natural/cartoon/wawa/…） → VoiceChanger 波形变声，保留语调
+        #   manbo                              → CosyVoice 音色克隆，像特定人
+        self.vc = None
+        self.cosy = None
+        self.current_voice = args.voice
+        self.voice_label = args.voice
+        self.switch_voice(args.voice)
 
     # ── 屏幕 ───────────────────────────────────────────────
     def show(self, buf):
@@ -256,6 +320,47 @@ class App(object):
         print("  识别文字: %s" % (r.text or "(空)"))
         return r
 
+    # ── 音色切换 ───────────────────────────────────────────
+    def switch_voice(self, name, quiet=False):
+        """切换当前音色。
+
+        name 可以是 DSP 预设名（natural/cartoon/wawa/wawa_oct/off），
+        也可以是 COSSY_VOICES 里的名字（manbo）。
+        """
+        self.current_voice = name
+        self.vc = None
+        self.cosy = None
+
+        if name == "off":
+            self.voice_label = VOICE_LABELS.get("off", "不变声")
+            if not quiet:
+                print("🎛  变声：关闭")
+            return
+
+        if name in COSSY_VOICES:
+            self.voice_label = VOICE_LABELS.get(name, name)
+            try:
+                self.cosy = CosyVoice.from_preset(
+                    name, root=self.args.cosy_root, out_dir=self.args.cosy_out)
+                missing = self.cosy.check()
+                if missing:
+                    raise RuntimeError("缺少 %s" % missing[0])
+                print("🎙  音色：%s（CosyVoice 音色克隆）" % self.voice_label)
+            except Exception as exc:  # noqa: BLE001
+                print("⚠️  无法启用「%s」：%s" % (name, exc))
+                print("   回退到瓦瓦音色")
+                self.current_voice = "wawa"
+                self.voice_label = VOICE_LABELS.get("wawa", "wawa")
+                self.vc = VoiceChanger.from_preset("wawa")
+            return
+
+        self.vc = VoiceChanger.from_preset(name)
+        self.voice_label = VOICE_LABELS.get(name,
+                                            PRESET_LABELS.get(name, name))
+        if not quiet:
+            print("🎛  变声：%s（%+.2f 半音）"
+                  % (self.voice_label, PRESETS[name]))
+
     def process(self, samples, result):
         """处理阶段 —— 变声 DSP
 
@@ -264,7 +369,7 @@ class App(object):
         if self.vc is None:
             return samples
 
-        self.show(self.screens.busy("变声处理中…", self.voice_label))
+        # 屏幕保持显示识别到的那句话，不切画面（变声只要 0.5 秒，切了反而闪）
         print("🎛  变声：%s" % self.voice_label)
         t0 = time.time()
         out = self.vc.process(samples, audio.RECORD_RATE)
@@ -272,20 +377,28 @@ class App(object):
         return out
 
     def play_changed(self, samples, result):
-        """把变声后的声音放出来 —— 这是演示的重点"""
+        """把变声后的声音放出来 —— 屏幕保持显示识别到的那句话"""
         import soundfile as sf
 
         out = self.args.voice_out
         sf.write(out, samples, audio.RECORD_RATE)
-
-        self.show(self.screens.text_page(
-            "变声效果",
-            (result.text or "") + "\n\n听一下这个声音",
-            footer="预设：%s" % self.voice_label,
-            title_color=(255, 180, 100),
-        ))
         print("🔊 播放变声结果…")
         audio.play_wav(out, device=audio.find_alsa_device("output"))
+
+    def play_cosy(self, text, result):
+        """用 CosyVoice 音色克隆把这句话念出来（曼波音色走这条路）
+
+        屏幕保持显示识别到的那句话，不做额外装饰。
+        """
+        self.state = SPEAKING
+        print("🎙  音色克隆（%s）：%s" % (self.voice_label, text))
+
+        wav, metrics = self.cosy.synthesize(text)
+        print("  合成耗时 %.2f s | 音频 %s s | 持续 RTF %s"
+              % (metrics.get("elapsed", 0),
+                 metrics.get("audio_seconds", "?"),
+                 metrics.get("steady_pcm_rtf", "?")))
+        audio.play_wav(wav, device=audio.find_alsa_device("output"))
 
     def reply(self, result):
         """生成回应文本"""
@@ -369,29 +482,37 @@ class App(object):
                             else "AI 语音链路就绪"))
                         continue
 
-                    # 显示识别结果
+                    # ── 语音切换音色的指令 ──
+                    # 说「我是曼波」/「我是瓦瓦」：这句话**不做变声**，只切换音色。
+                    # 屏幕照样只显示识别到的话，用两声提示音确认切换。
+                    cmd = detect_voice_command(text)
+                    if cmd is not None:
+                        print("\n🎚 检测到音色切换指令 → %s" % cmd)
+                        self.switch_voice(cmd)
+                        self.last_text = text
+                        self.show(self.screens.plain(text))
+                        audio.beep(times=2, freq=900, duration=0.10, gap=0.08,
+                                   volume=0.5,
+                                   device=audio.find_alsa_device("output"))
+                        time.sleep(1.5)
+                        continue
+
+                    # 屏幕上只显示识别到的那句话，不加标题、页脚、装饰
                     self.state = RESULT
                     self.last_text = text
-                    self.show(self.screens.text_page(
-                        "我听到了",
-                        text,
-                        footer="%.2f s 识别  %.0f 倍速  %s"
-                               % (result.elapsed, result.realtime_factor,
-                                  result.lang.strip("<|>")),
-                    ))
-                    time.sleep(self.args.result_hold)
+                    self.show(self.screens.plain(text))
+                    print("  📺 显示：%s" % text)
+                    time.sleep(0.3)
 
-                    # 处理（变声）
-                    processed = self.process(samples, result)
-
-                    # 先播变声效果 —— 这是演示的重点
-                    if self.vc is not None:
-                        self.play_changed(processed, result)
-                        time.sleep(0.6)
-
-                    # 再用 TTS 回应
-                    if self.tts is not None:
-                        self.speak(self.reply(result))
+                    # ── 按当前音色选择引擎 ──
+                    if self.current_voice in COSSY_VOICES and self.cosy is not None:
+                        # 曼波音色：把你说的这句话用曼波音色念出来
+                        self.play_cosy(text, result)
+                    else:
+                        # DSP 波形变声（保留语调）
+                        processed = self.process(samples, result)
+                        if self.vc is not None:
+                            self.play_changed(processed, result)
 
                 except KeyboardInterrupt:
                     raise
@@ -443,10 +564,20 @@ def main():
                     help="识别结果显示停留时间（秒）")
     ap.add_argument("--reply", default="echo", choices=["echo", "fixed"],
                     help="回应方式：echo=复述识别文本，fixed=固定一句话")
-    ap.add_argument("--no-tts", action="store_true", help="不做语音合成（只识别）")
+    ap.add_argument("--tts", action="store_true",
+                    help="加载 MeloTTS 做语音合成（默认不加载，省 8 秒启动）")
+    ap.add_argument("--no-tts", action="store_true",
+                    help="兼容旧参数，现在默认就是不加载")
     ap.add_argument("--voice", default="wawa",
-                    choices=sorted(PRESETS.keys()) + ["off"],
-                    help="变声预设（默认 wawa；off = 不变声）")
+                    choices=sorted(set(list(PRESETS.keys())
+                                       + list(COSSY_VOICES) + ["off"])),
+                    help="当前音色（默认 wawa）。"
+                         "natural/cartoon/wawa/wawa_oct = DSP 波形变声（保留语调）；"
+                         "manbo = CosyVoice 音色克隆（像曼波，但丢语调）；off = 不变声")
+    ap.add_argument("--cosy-root", default=None,
+                    help="CosyVoice 项目根目录（默认 ~/proj/cosyvoice2_rknn）")
+    ap.add_argument("--cosy-out", default="/tmp/cosy_app",
+                    help="CosyVoice 合成输出目录")
     ap.add_argument("--voice-out", default="/tmp/app_voice.wav",
                     help="变声结果的输出 wav")
     ap.add_argument("--tts-out", default="/tmp/app_tts.wav", help="TTS 输出文件")
