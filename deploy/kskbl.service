@@ -1,0 +1,42 @@
+[Unit]
+Description=kskbl 会听会变声的智能终端（屏幕 + 语音识别 + 变声）
+Documentation=https://github.com/ShizhenZhou/YingcaiCup-kskbl
+# 等声音子系统和网络就绪；USB 声卡是热插拔的，靠下面的 ExecStartPre 多等一会儿
+After=sound.target network.target
+Wants=sound.target
+
+[Service]
+Type=simple
+User=radxa
+Group=radxa
+WorkingDirectory=/home/radxa/proj/kskbl
+
+# USB 声卡和 SPI/GPIO 需要一点时间就绪。
+# 如果还是太早，程序会因为找不到声卡退出，systemd 5 秒后自动重启，最终能起来。
+ExecStartPre=/bin/sleep 8
+
+# 自动循环：待机 → 倒数 → 录音（静音 3 秒自动停）→ 识别 → 变声 → 播放
+# --duration 是最长录音时长（保险），--silence-stop 3 是说完停顿 3 秒就结束
+ExecStart=/home/radxa/proj/venv/bin/python -u src/kskbl/app.py \
+    --trigger auto \
+    --gap 3 \
+    --duration 15 \
+    --silence-stop 3 \
+    --mic-gain 28 \
+    --voice wawa
+
+# 崩了自动拉起
+Restart=always
+RestartSec=5
+
+# 日志进 journald，用 journalctl -u kskbl -f 查看
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kskbl
+
+# 给足时间正常退出（播放/录音结束）
+TimeoutStopSec=15
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

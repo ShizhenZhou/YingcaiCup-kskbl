@@ -1,0 +1,13 @@
+# kskbl 语音终端 —— 允许 radxa 用户免密关机
+#
+# 只是为了实现「说『关机』就让板子断电」这一个功能。
+# ⚠️ 注意这里的命令是**精确列举**的：
+#    systemctl 只允许 poweroff 这一个子命令，不能起停其它服务，
+#    避免把整个 systemctl 开放成 root 权限（那等于给了完整 root）。
+#
+# 安装位置：/etc/sudoers.d/kskbl-shutdown
+# 权限必须是 0440，属主 root:root，否则 sudo 会拒绝加载。
+
+Cmnd_Alias KSKBL_POWEROFF = /sbin/poweroff, /usr/sbin/poweroff, /bin/systemctl poweroff, /usr/bin/systemctl poweroff
+
+radxa ALL=(root) NOPASSWD: KSKBL_POWEROFF

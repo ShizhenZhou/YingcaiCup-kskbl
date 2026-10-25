@@ -41,6 +41,7 @@
 import argparse
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -92,6 +93,47 @@ _VOICE_PATTERNS = [
 VOICE_ALIASES = [
     ("manbo", ("哈基米",)),
 ]
+
+# ── 关机指令 ──────────────────────────────────────────────
+# 「关机」只有两个字，ASR 很容易在别的句子里误命中，
+# 一旦误触发板子就断电了。所以采取**整句严格匹配**：
+#   去掉标点后，整句必须正好等于"关机"（可以带礼貌前后缀）。
+#   像「我要关机充电」「关机键在哪」这种**不会**触发。
+SHUTDOWN_WORDS = ("关机", "关闭机器", "关掉机器", "关闭系统")
+SHUTDOWN_PREFIXES = ("请", "帮我", "可以", "麻烦", "快", "现在")
+SHUTDOWN_SUFFIXES = ("吧", "了", "啦", "谢谢", "一下", "吧谢谢")
+
+
+def detect_shutdown_command(text):
+    """检测是否在要求关机。只有整句表达这个意思才返回 True。
+
+    >>> detect_shutdown_command("关机")        -> True
+    >>> detect_shutdown_command("关机吧！")     -> True
+    >>> detect_shutdown_command("请关机")      -> True
+    >>> detect_shutdown_command("我要关机充电") -> False
+    >>> detect_shutdown_command("关机键在哪")   -> False
+    """
+    if not text:
+        return False
+
+    flat = "".join(text.split())
+    flat = flat.strip(" .,。，!！?？…、;；:：\"'")
+
+    # 反复剥掉礼貌前后缀，最后必须正好剩下一个关机词
+    for _ in range(3):
+        changed = False
+        for p in SHUTDOWN_PREFIXES:
+            if flat.startswith(p) and len(flat) > len(p):
+                flat = flat[len(p):]
+                changed = True
+        for s in SHUTDOWN_SUFFIXES:
+            if flat.endswith(s) and len(flat) > len(s):
+                flat = flat[:-len(s)]
+                changed = True
+        if not changed:
+            break
+
+    return flat in SHUTDOWN_WORDS
 
 
 # 这些音色走 CosyVoice 音色克隆（文字→语音），其余走 DSP 波形变声
@@ -475,6 +517,46 @@ class App(object):
         print("🔊 播放回应：%s" % text)
         return info
 
+    def shutdown(self):
+        """执行关机。
+
+        ⚠️ 这是破坏性操作：选检测函数时已经做了整句严格匹配，
+           这里再给屏幕和两声低音做最后确认，然后调用系统关机。
+        """
+        print("\n🛑 收到关机指令")
+        self.show(self.screens.plain("关机中…"))
+
+        dev = audio.find_alsa_device("output")
+        audio.beep(times=1, freq=400, duration=0.25, volume=0.6, device=dev)
+        time.sleep(0.35)
+        audio.beep(times=1, freq=300, duration=0.45, volume=0.6, device=dev)
+
+        ok = False
+        for cmd in (["sudo", "-n", "poweroff"],
+                    ["sudo", "-n", "systemctl", "poweroff"]):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=20)
+                if r.returncode == 0:
+                    print("  已发出关机命令：%s" % " ".join(cmd))
+                    ok = True
+                    break
+                print("  %s 失败（exit %d）：%s"
+                      % (" ".join(cmd), r.returncode,
+                         (r.stderr or r.stdout or "").strip()[:200]))
+            except Exception as exc:  # noqa: BLE001
+                print("  %s 异常：%s" % (" ".join(cmd), exc))
+
+        if not ok:
+            print("  ⚠️ 关机失败。请确认 sudoers 已配置：")
+            print("     sudo bash deploy/install_service.sh install")
+            self.show(self.screens.plain("关机失败"))
+            time.sleep(2.0)
+            return
+
+        # 关机过程中不要再去录下一轮；系统几秒后会断电
+        time.sleep(30)
+
     # ── 主循环 ─────────────────────────────────────────────
     def run(self):
         self.show(self.screens.idle("待机中", footer="触发方式：%s" % self.args.trigger))
@@ -515,6 +597,13 @@ class App(object):
                             footer=("上次：" + last[:26]) if last
                             else "AI 语音链路就绪"))
                         continue
+
+                    # ── 关机指令 ──
+                    # 必须整句表达关机才触发（「我要关机充电」不会命中），
+                    # 见 detect_shutdown_command 的说明。
+                    if detect_shutdown_command(text):
+                        self.shutdown()
+                        return
 
                     # ── 语音切换音色的指令 ──
                     # 只有**确实要换**音色时才走切换流程（这句话本身不变声）。
