@@ -393,16 +393,21 @@ class App(object):
         self.state = SPEAKING
         print("🎙  音色克隆（%s）：%s" % (self.voice_label, text))
 
-        # 合成要 10~20 秒，屏幕上给个进度条，别让人以为卡死了
+        # 屏幕上：上半屏显示要念的文字，下半屏显示进度条（10~20 秒，别让人干等）
         def on_progress(ratio):
-            self.show(self.screens.progress("合成中…", ratio))
+            self.show(self.screens.speech_progress(text, ratio))
 
-        self.show(self.screens.progress("合成中…", 0.0))
+        self.show(self.screens.speech_progress(text, 0.0))
         wav, metrics = self.cosy.synthesize(text, on_progress=on_progress)
         print("  合成耗时 %.2f s | 音频 %s s | 持续 RTF %s"
               % (metrics.get("elapsed", 0),
                  metrics.get("audio_seconds", "?"),
                  metrics.get("steady_pcm_rtf", "?")))
+
+        # 合成完成 → 进度条直接跳到 100%，给个"做完了"的明确反馈
+        self.show(self.screens.speech_progress(text, 1.0, title="合成完成"))
+        time.sleep(0.4)
+
         audio.play_wav(wav, device=audio.find_alsa_device("output"))
 
     def reply(self, result):

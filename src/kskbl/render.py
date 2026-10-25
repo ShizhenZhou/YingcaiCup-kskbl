@@ -330,6 +330,45 @@ class Screens(object):
         _center(d, pct + ("  " + unit if unit else ""), 154, font(13), FG_DIM)
         return to_buffer(img)
 
+    def speech_progress(self, text, ratio=0.0, title="合成中…"):
+        """上半屏显示识别到的文字，下半屏显示进度条。
+
+        音色克隆要十几秒，把"要念的内容"和"正在处理"同时摆在屏幕上，
+        用户一眼就知道系统在做什么，而不是干等一个光秃秃的进度条。
+
+        布局（240×240）：
+            0   ~ 112   识别文字（最多 4 行）
+            118        分隔线
+            126        标题（合成中…）
+            152 ~ 164  进度条
+            176        百分比
+        """
+        img, d = new_canvas(width=self.width, height=self.height)
+        ratio = max(0.0, min(1.0, float(ratio)))
+        pad = 14
+
+        # ── 上半屏：识别到的文字 ──
+        _draw_text_block(d, text, (pad, 10, self.width - pad, 112),
+                         font(17), FG, max_lines=4)
+
+        # ── 分隔线 ──
+        d.line([(pad, 118), (self.width - pad, 118)], fill=FG_DIM)
+
+        # ── 下半屏：进度条 ──
+        _center(d, title, 124, font(14), FG_DIM)
+
+        x0, x1 = 26, self.width - 26
+        y, h = 152, 12
+        d.rounded_rectangle([(x0, y), (x1, y + h)], radius=6,
+                            fill=BG_CARD, outline=FG_DIM)
+        w = int((x1 - x0 - 4) * ratio)
+        if w > 3:
+            d.rounded_rectangle([(x0 + 2, y + 2), (x0 + 2 + w, y + h - 2)],
+                                radius=5, fill=ACCENT)
+
+        _center(d, "%d%%" % int(round(ratio * 100)), 174, font(13), FG_DIM)
+        return to_buffer(img)
+
     # ── 错误 ─────────────────────────────────────────────
     def error(self, message, detail=""):
         img, d = new_canvas(width=self.width, height=self.height)
