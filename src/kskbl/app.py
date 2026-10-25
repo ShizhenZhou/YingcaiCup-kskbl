@@ -393,7 +393,12 @@ class App(object):
         self.state = SPEAKING
         print("🎙  音色克隆（%s）：%s" % (self.voice_label, text))
 
-        wav, metrics = self.cosy.synthesize(text)
+        # 合成要 10~20 秒，屏幕上给个进度条，别让人以为卡死了
+        def on_progress(ratio):
+            self.show(self.screens.progress("合成中…", ratio))
+
+        self.show(self.screens.progress("合成中…", 0.0))
+        wav, metrics = self.cosy.synthesize(text, on_progress=on_progress)
         print("  合成耗时 %.2f s | 音频 %s s | 持续 RTF %s"
               % (metrics.get("elapsed", 0),
                  metrics.get("audio_seconds", "?"),
@@ -488,13 +493,14 @@ class App(object):
                     cmd = detect_voice_command(text)
                     if cmd is not None:
                         print("\n🎚 检测到音色切换指令 → %s" % cmd)
+                        # 切换时说了一句什么不重要，屏幕上直接显示「切换中…」
+                        self.show(self.screens.plain("切换中…"))
                         self.switch_voice(cmd)
                         self.last_text = text
-                        self.show(self.screens.plain(text))
                         audio.beep(times=2, freq=900, duration=0.10, gap=0.08,
                                    volume=0.5,
                                    device=audio.find_alsa_device("output"))
-                        time.sleep(1.5)
+                        time.sleep(1.2)
                         continue
 
                     # 屏幕上只显示识别到的那句话，不加标题、页脚、装饰

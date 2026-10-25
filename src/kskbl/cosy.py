@@ -105,10 +105,13 @@ class CosyVoice(object):
                 missing.append(p)
         return missing
 
-    def synthesize(self, text, out_dir=None, timeout=None):
-        """合成并返回 wav 路径；失败抛 RuntimeError。
+    def synthesize(self, text, out_dir=None, timeout=None, on_progress=None):
+        """合成并返回 (wav_path, metrics)。
 
-        返回 (wav_path, metrics_dict)
+        on_progress(ratio)  可选的进度回调，ratio 0.0~1.0。
+            进度是**按时间渐进**的估算（不是模型真实进度），
+            越接近完成推进得越慢，最多到 0.95，
+            这样不会出现"卡在 99%"或"进度回退"的观感。
         """
         if not text or not text.strip():
             raise ValueError("文本为空")
@@ -135,20 +138,35 @@ class CosyVoice(object):
 
         script = os.path.join(self.rknn, "scripts",
                               "run_cosyvoice2_streaming_rk3588.sh")
+        limit = timeout or self.timeout
         t0 = time.time()
-        proc = subprocess.run(["bash", script, "sample"], env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True, timeout=timeout or self.timeout)
+
+        proc = subprocess.Popen(["bash", script, "sample"], env=env,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        import math
+
+        while proc.poll() is None:
+            elapsed = time.time() - t0
+            if elapsed > limit:
+                proc.kill()
+                raise RuntimeError("CosyVoice 合成超时（%.0f 秒）" % limit)
+            if on_progress is not None:
+                # 渐进式：tau 秒后大约走到 63%，之后越来越慢，封顶 0.95
+                on_progress(0.95 * (1.0 - math.exp(-elapsed / 12.0)))
+            time.sleep(0.15)
+
+        stdout, _ = proc.communicate()
         elapsed = time.time() - t0
 
         wav = os.path.join(out, "streaming_segment00.wav")
         if proc.returncode != 0 or not os.path.exists(wav):
-            tail = "\n".join((proc.stdout or "").splitlines()[-15:])
+            tail = "\n".join((stdout or "").splitlines()[-15:])
             raise RuntimeError("CosyVoice 合成失败（exit %d）\n%s"
                                % (proc.returncode, tail))
 
         metrics = {"elapsed": elapsed, "wav": wav}
-        for line in (proc.stdout or "").splitlines():
+        for line in (stdout or "").splitlines():
             k, sep, v = line.partition("=")
             if sep and k.strip().isidentifier():
                 metrics[k.strip()] = v.strip()

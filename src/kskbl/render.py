@@ -306,6 +306,30 @@ class Screens(object):
         _draw_text_block(d, text, (x0, y0, x1, y1), f, FG)
         return to_buffer(img)
 
+    def progress(self, title="合成中", ratio=0.0, unit=""):
+        """标题 + 进度条 + 百分比 —— 耗时较长的处理用这个给用户反馈。
+
+        ratio 是 0.0~1.0。调用方自己决定怎么推进，
+        比如按时间做渐进式进度（越接近完成越发慢）。
+        """
+        img, d = new_canvas(width=self.width, height=self.height)
+        ratio = max(0.0, min(1.0, float(ratio)))
+
+        _center(d, title, 86, font(18), FG)
+
+        x0, x1 = 28, self.width - 28
+        y, h = 124, 12
+        d.rounded_rectangle([(x0, y), (x1, y + h)], radius=6,
+                            fill=BG_CARD, outline=FG_DIM)
+        w = int((x1 - x0 - 4) * ratio)
+        if w > 3:
+            d.rounded_rectangle([(x0 + 2, y + 2), (x0 + 2 + w, y + h - 2)],
+                                radius=5, fill=ACCENT)
+
+        pct = "%d%%" % int(round(ratio * 100))
+        _center(d, pct + ("  " + unit if unit else ""), 154, font(13), FG_DIM)
+        return to_buffer(img)
+
     # ── 错误 ─────────────────────────────────────────────
     def error(self, message, detail=""):
         img, d = new_canvas(width=self.width, height=self.height)
