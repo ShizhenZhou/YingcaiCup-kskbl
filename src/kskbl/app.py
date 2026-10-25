@@ -78,8 +78,14 @@ ERROR = "error"
 #    所以改用**字符类正则**：只要相邻两个字符分别落在同音字集合里就算命中。
 #    不要求"我是"前缀（句子里出现这个词就当成指令）。
 _VOICE_PATTERNS = [
+    # 「我是曼波」的各种同音写法
     ("manbo", re.compile("[曼慢漫满蛮蔓][波播拨博簸步]")),
     ("wawa", re.compile("[瓦娃哇挖袜][瓦娃哇挖袜]")),
+
+    # 「切换到音色1」/「音色一」。
+    # ASR 常把"音色"识别成同音的"银色"，数字也可能写成汉字，所以都覆盖。
+    ("manbo", re.compile("[音银][色瑟]\\s*[1一壹]")),
+    ("wawa", re.compile("[音银][色瑟]\\s*[2二贰]")),
 ]
 
 # 同义词（整个梗的其他叫法）
@@ -104,12 +110,15 @@ VOICE_LABELS = {
 def detect_voice_command(text):
     """从识别文本里找语音切换指令，返回音色名或 None。
 
-    用同音字字符类匹配，容忍 ASR 把"曼波"识别成"慢播/漫播"之类。
+    支持两种说法（每种都容忍同音字）：
+        「我是曼波」      == 「切换到音色1」  → manbo
+        「我是瓦瓦」      == 「切换到音色2」  → wawa
 
-    >>> detect_voice_command("我是慢播。")    -> "manbo"
-    >>> detect_voice_command("我是漫播。")    -> "manbo"
-    >>> detect_voice_command("我是娃娃。")    -> "wawa"
-    >>> detect_voice_command("今天天气不错")  -> None
+    >>> detect_voice_command("我是慢播。")          -> "manbo"
+    >>> detect_voice_command("切换到音色1")        -> "manbo"
+    >>> detect_voice_command("切换到银色一")        -> "manbo"
+    >>> detect_voice_command("切换到音色2")        -> "wawa"
+    >>> detect_voice_command("今天天气不错")        -> None
     """
     if not text:
         return None
