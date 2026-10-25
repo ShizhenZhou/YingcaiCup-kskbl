@@ -517,10 +517,11 @@ class App(object):
                         continue
 
                     # ── 语音切换音色的指令 ──
-                    # 说「我是曼波」/「我是瓦瓦」：这句话**不做变声**，只切换音色。
-                    # 屏幕照样只显示识别到的话，用两声提示音确认切换。
+                    # 只有**确实要换**音色时才走切换流程（这句话本身不变声）。
+                    # 如果当前已经是这个音色，说明用户在说一句普通的话，
+                    # 那就照常把整句念出来 —— 不切换也不吞掉。
                     cmd = detect_voice_command(text)
-                    if cmd is not None:
+                    if cmd is not None and cmd != self.current_voice:
                         print("\n🎚 检测到音色切换指令 → %s" % cmd)
                         # 切换时说了一句什么不重要，屏幕上直接显示「切换中…」
                         self.show(self.screens.plain("切换中…"))
@@ -531,6 +532,10 @@ class App(object):
                                    device=audio.find_alsa_device("output"))
                         time.sleep(1.2)
                         continue
+
+                    if cmd is not None:
+                        # 已经是这个音色 —— 当普通句子照常处理
+                        print("\n🎚 提到「%s」，但当前已是该音色，按普通句子处理" % cmd)
 
                     # 屏幕上只显示识别到的那句话，不加标题、页脚、装饰
                     self.state = RESULT
