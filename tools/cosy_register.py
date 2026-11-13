@@ -416,19 +416,32 @@ def main():
     # ⚠️ speech tokenizer 是固定 1753 帧（17.53 秒）的静态模型，
     #    所以音频必须裁到这个长度，不能靠补零（注意力会被稀释）。
     print("[3/5] prompt 特征")
-    pwav16 = fit_length(load_mono(args.prompt_wav, 16000), TOKENIZER_SAMPLES_16K)
-    pwav24 = fit_length(load_mono(args.prompt_wav, 24000), TOKENIZER_SAMPLES_24K)
-    raw_tokens = fe.speech_tokens(pwav16)
-    mel = mel24(pwav24)
-    aligned = min(len(mel) // 2, len(raw_tokens))
-    tokens = raw_tokens[:aligned]
-    print("      prompt %.2f s → 原始 token %d 个，对齐后 %d 个 | mel %d 帧"
-          % (len(pwav16) / 16000.0, len(raw_tokens), len(tokens), len(mel)))
+    raw16 = load_mono(args.prompt_wav, 16000)
+    raw24 = load_mono(args.prompt_wav, 24000)
+    real_dur = len(raw16) / 16000.0
 
-    # LLM prompt 用前 3 秒（25 token/秒）；flow prompt 用末 2 秒
-    llm_tokens = tokens[:75]
-    flow_tokens = tokens[-50:]
+    pwav16 = fit_length(raw16, TOKENIZER_SAMPLES_16K)
+    raw_tokens = fe.speech_tokens(pwav16)
+
+    # ⚠️ flow prompt（末 2 秒）必须从**真实语音**里取！
+    #    素材短于 17.53 秒时末尾补的是静音，如果直接取补零后的尾部，
+    #    flow 拿到的就是一段纯静音，音色完全迁移不过去。
+    #   （实测：10.2 秒素材补零后，克隆输出 F0 274 Hz，和默认音色 261 Hz 几乎一样）
+    mel = mel24(raw24)                       # 用未补零的音频算 mel
     flow_mel = mel[-100:]
+
+    real_tokens = max(1, int(round(real_dur * 25.0)))
+    real_tokens = min(real_tokens, len(raw_tokens))
+    ff_tokens = raw_tokens[:real_tokens]
+    flow_tokens = ff_tokens[-50:]
+
+    print("      prompt 真实时长 %.2f s（补零到 %.2f s 供 tokenizer 用）"
+          % (real_dur, TOKENIZER_SAMPLES_16K / 16000.0))
+    print("      原始 token %d 个（真实语音 %d 个）| mel %d 帧"
+          % (len(raw_tokens), len(ff_tokens), len(mel)))
+
+    # LLM prompt 用前 3 秒（25 token/秒）
+    llm_tokens = ff_tokens[:75]
     print("      LLM prompt %d token | flow prompt %d token + %d 帧 mel"
           % (len(llm_tokens), len(flow_tokens), len(flow_mel)))
 
