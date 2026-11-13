@@ -690,6 +690,15 @@ class App(object):
 
     # ── 主循环 ─────────────────────────────────────────────
     def run(self):
+        # 启动横幅里带上代码修改时间 —— 排查时一眼就能确认服务跑的是不是最新代码
+        # （踩过好几次：改了代码没重启服务，看到的一直是旧行为）
+        try:
+            mtime = os.path.getmtime(os.path.abspath(__file__))
+            print("  代码版本：app.py 修改于 %s"
+                  % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)))
+        except OSError:
+            pass
+
         self.show(self.screens.idle("待机中", footer="触发方式：%s" % self.args.trigger))
         print("\n" + "=" * 62)
         print("  ✅ 就绪，屏幕已显示待机画面")
