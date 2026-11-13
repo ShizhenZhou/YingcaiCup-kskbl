@@ -18,13 +18,19 @@ ExecStartPre=/bin/sleep 8
 # 自动循环：待机 → 校准噪声 → 倒数 → 录音（静音 3 秒自动停）→ 识别 → 变声 → 播放
 #   --duration 15      最长录音时长（保险）
 #   --silence-stop 3   说完停顿 3 秒自动结束
-#   --noise-margin 8   比环境噪声高 8 dB 才算「在说话」（自适应门限，环境吵也不会一直录）
+#   --noise-margin 15  比环境噪声高 15 dB 才算「在说话」
+#                      （从 8 大幅调高，抗噪更严格）
+#                      ⚠️ 上限受信噪比约束：门限不能超过「说话音量 − 噪声」，
+#                         否则自己的说话也会被判成静音，录 3 秒就结束。
+#                         环境特别吵（> -35 dBFS）时要降到 10~12。
+#   --speech-floor -35 说话判定的绝对下限 dBFS
 ExecStart=/home/radxa/proj/venv/bin/python -u src/kskbl/app.py \
     --trigger auto \
     --gap 3 \
     --duration 15 \
     --silence-stop 3 \
-    --noise-margin 8 \
+    --noise-margin 15 \
+    --speech-floor -35 \
     --mic-gain 28 \
     --voice wawa
 

@@ -319,7 +319,7 @@ class App(object):
             self.show(self.screens.busy("校准环境噪音…", "保持安静 0.6 秒"))
             calib = self.recorder.record(0.6, tick=0.05)
             noise_db = audio.measure_noise_floor(calib, audio.RECORD_RATE)
-            need = max(noise_db + self.args.noise_margin, -40.0)
+            need = max(noise_db + self.args.noise_margin, self.args.speech_floor)
             print("🎚  环境噪声基线 %.1f dBFS → 说话门限 %.1f dBFS（高 %.0f dB 才算说话）"
                   % (noise_db, need, self.args.noise_margin))
 
@@ -352,7 +352,8 @@ class App(object):
         samples = self.recorder.record(
             self.args.duration, level_cb=on_level, tick=0.12,
             silence_stop=self.args.silence_stop or None,
-            noise_dbfs=noise_db, margin_db=self.args.noise_margin)
+            noise_dbfs=noise_db, margin_db=self.args.noise_margin,
+            abs_speech_dbfs=self.args.speech_floor)
         info = getattr(self.recorder, "last_info", {})
 
         # 两声低音 = 录音结束
@@ -702,6 +703,9 @@ def main():
     ap.add_argument("--noise-margin", type=float, default=8.0,
                     help="比环境噪声高多少 dB 才算「在说话」（默认 8）。"
                          "环境吵就调大，说话轻就调小")
+    ap.add_argument("--speech-floor", type=float, default=-40.0,
+                    help="说话判定的绝对下限 dBFS（默认 -40）。"
+                         "噪声极安静时防止把呼吸/底噪当说话；调高更严格")
     ap.add_argument("--result-hold", type=float, default=1.5,
                     help="识别结果显示停留时间（秒）")
     ap.add_argument("--reply", default="echo", choices=["echo", "fixed"],
