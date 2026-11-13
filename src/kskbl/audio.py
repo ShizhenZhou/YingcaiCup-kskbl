@@ -298,6 +298,7 @@ class Recorder(object):
 
         buf = np.zeros(frames, dtype=np.float32)
         state = {"pos": 0, "level": 0.0}
+        last_pos = -1
 
         def callback(indata, nframes, time_info, status):
             n = min(nframes, frames - state["pos"])
@@ -324,6 +325,7 @@ class Recorder(object):
         t_end = t0 + seconds
         spoken = 0.0      # 累计有声时长
         silent = 0.0      # 当前连续静音时长
+        stall = 0.0       # 音频数据停止到达的时长（设备被拔掉）
         reason = "录满上限"
 
         with stream:
@@ -332,6 +334,18 @@ class Recorder(object):
                 if now >= t_end:
                     reason = "已录满 %.1f 秒上限" % seconds
                     break
+
+                # ── 设备被拔掉检测 ──
+                # 拔掉 USB 声卡后回调不再触发，缓冲区停止增长。
+                # 不检测的话循环会一直跑到时长上限，白等十几秒。
+                if state["pos"] == last_pos:
+                    stall += tick
+                    if stall >= 0.5:
+                        reason = "音频设备已断开（录音中断）"
+                        break
+                else:
+                    stall = 0.0
+                    last_pos = state["pos"]
 
                 lvl = state["level"]
                 ratio = level_to_ratio(lvl)

@@ -335,6 +335,35 @@ class App(object):
         print("  ⚠️ 声卡已插入但一直配置失败，跳过这一轮")
         return False
 
+    def _ensure_output(self):
+        """播放前确认声卡插着。
+
+        USB 声卡同时是麦克风和扬声器 —— 录完音就把它拔掉的话，
+        播放时设备已经没了。这里在播放前等一下，让用户插回来。
+
+        非 usb 触发模式下直接返回（用户自己会管设备）。
+        """
+        if self.args.trigger != "usb":
+            return True
+        if self._usb_card_present():
+            return True
+
+        print("  声卡已拔出，等它插回来再播放…")
+        self.show(self.screens.plain("请插上声卡播放"))
+        while not self._usb_card_present():
+            time.sleep(0.4)
+
+        # 设备枚举需要一点时间，顺便重新解析卡号
+        for _ in range(20):
+            time.sleep(0.4)
+            try:
+                if self.setup_audio():
+                    print("  ✅ 声卡插回来了，开始播放")
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
     def after_round(self):
         """一轮结束后的收尾。USB 触发模式下要等用户把声卡拔掉。"""
         if self.args.trigger != "usb":
@@ -545,6 +574,9 @@ class App(object):
         out = self.args.voice_out
         sf.write(out, samples, audio.RECORD_RATE)
         print("🔊 播放变声结果…")
+        if not self._ensure_output():
+            print("  ⚠️ 声卡一直没插回来，跳过播放")
+            return
         audio.play_wav(out, device=audio.find_alsa_device("output"))
 
     def play_cosy(self, text, result):
@@ -570,6 +602,9 @@ class App(object):
         self.show(self.screens.speech_progress(text, 1.0, title="合成完成"))
         time.sleep(0.4)
 
+        if not self._ensure_output():
+            print("  ⚠️ 声卡一直没插回来，跳过播放")
+            return
         audio.play_wav(wav, device=audio.find_alsa_device("output"))
 
     def reply(self, result):
