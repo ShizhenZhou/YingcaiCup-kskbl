@@ -369,6 +369,35 @@ class Screens(object):
         _center(d, "%d%%" % int(round(ratio * 100)), 174, font(13), FG_DIM)
         return to_buffer(img)
 
+    def text_hint(self, text, hint, hint_color=None):
+        """上半屏显示文字，下半屏显示一行提示。
+
+        用在「识别完成、等用户插回声卡」这种场景：
+        既让人看到识别出来的内容，又清楚知道下一步该做什么。
+        """
+        img, d = new_canvas(width=self.width, height=self.height)
+        pad = 14
+        hint_color = hint_color or ACCENT
+
+        # ── 上半屏：正文 ──
+        _draw_text_block(d, text, (pad, 10, self.width - pad, 118),
+                         font(18), FG, max_lines=4)
+
+        # ── 分隔线 ──
+        d.line([(pad, 124), (self.width - pad, 124)], fill=FG_DIM)
+
+        # ── 下半屏：提示（居中，最多两行）──
+        f = font(15)
+        lines = wrap_text(d, hint, f, self.width - 2 * pad)
+        total = len(lines) * (f.size + 3)
+        y = 138 + max(0, (self.height - 138 - pad - total) // 2)
+        for line in lines[:3]:
+            w = d.textlength(line, font=f)
+            d.text(((self.width - w) / 2, y), line, font=f, fill=hint_color)
+            y += f.size + 3
+
+        return to_buffer(img)
+
     # ── 错误 ─────────────────────────────────────────────
     def error(self, message, detail=""):
         img, d = new_canvas(width=self.width, height=self.height)

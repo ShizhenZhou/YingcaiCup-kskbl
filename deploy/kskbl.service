@@ -25,14 +25,18 @@ ExecStartPre=/bin/sleep 8
 #                         环境特别吵（> -35 dBFS）时要降到 10~12。
 #   --speech-floor -35 说话判定的绝对下限 dBFS
 # 触发方式：
-#   --trigger usb   插上 USB 声卡开始一轮，拔下结束（当前使用）
-#   --trigger auto  自动循环，不用插拔（想改成无人值守时用这个）
+#   --trigger usb   插上 USB 声卡开始录音，拔下结束（当前使用）
+#   --trigger auto  自动循环，不用插拔
+#
+# 录音什么时候结束：
+#   --silence-stop 0    **关闭**静音自动停 —— 只听拔声卡这一件事
+#   --duration 30       保险上限，防止忘了拔声卡一直录
 ExecStart=/home/radxa/proj/venv/bin/python -u src/kskbl/app.py \
     --trigger usb \
     --usb-id 0d8c:0014 \
     --gap 3 \
-    --duration 15 \
-    --silence-stop 3 \
+    --duration 30 \
+    --silence-stop 0 \
     --noise-margin 15 \
     --speech-floor -35 \
     --mic-gain 28 \

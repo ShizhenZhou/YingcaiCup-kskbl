@@ -335,11 +335,14 @@ class App(object):
         print("  ⚠️ 声卡已插入但一直配置失败，跳过这一轮")
         return False
 
-    def _ensure_output(self):
+    def _ensure_output(self, text=""):
         """播放前确认声卡插着。
 
         USB 声卡同时是麦克风和扬声器 —— 录完音就把它拔掉的话，
         播放时设备已经没了。这里在播放前等一下，让用户插回来。
+
+        等待期间屏幕：**上半显示识别到的话，下半提示插回声卡** ——
+        让用户既能看到结果，又清楚下一步做什么。
 
         非 usb 触发模式下直接返回（用户自己会管设备）。
         """
@@ -349,7 +352,12 @@ class App(object):
             return True
 
         print("  声卡已拔出，等它插回来再播放…")
-        self.show(self.screens.plain("请插上声卡播放"))
+        hint = "请插上声卡播放"
+        if text:
+            self.show(self.screens.text_hint(text, hint))
+        else:
+            self.show(self.screens.plain(hint))
+
         while not self._usb_card_present():
             time.sleep(0.4)
 
@@ -441,22 +449,34 @@ class App(object):
                   % (noise_db, need, self.args.noise_margin))
 
         # ── 给用户明确的「开始说话」信号 ──
-        # 3 声倒数的嘀（800Hz），最后一声长音（1400Hz）就是"开始说"。
-        # 没有提示音的话，人根本不知道什么时候该说（实测踩过这个坑：
-        # 前几次录音全是环境噪声，ASR 还因此编出一段通顺的假话）。
+        # 0. 插拔触发模式：插上声卡这一动作本身就是信号，不用再倒数
+        # 1. 其他模式：3 声倒数的嘀（800Hz），最后一声长音（1400Hz）就是"开始说"
+        #    （没有提示音的话人根本不知道什么时候该说，实测踩过这个坑）
         out_dev = audio.find_alsa_device("output")
-        for i in (3, 2, 1):
-            self.show(self.screens.busy("准备录音…", "倒数 %d —— 待会儿听到长音就开始说" % i))
-            audio.beep(times=1, freq=800, duration=0.15, volume=0.5, device=out_dev)
-            time.sleep(0.85)
 
-        self.show(self.screens.listening(levels, hint=hint))
-        audio.beep(times=1, freq=1400, duration=0.35, volume=0.6, device=out_dev)
-        if self.args.silence_stop and self.args.silence_stop > 0:
-            print("\n🔔 长音已响 —— 现在开始说话（说完停顿 %.1f 秒自动结束，最多 %.1f 秒）！"
-                  % (self.args.silence_stop, self.args.duration))
+        if self.args.trigger == "usb":
+            self.show(self.screens.listening(levels, hint=hint))
+            audio.beep(times=1, freq=1200, duration=0.12, volume=0.5,
+                       device=out_dev)
+            print("\n🔔 开始录音（拔掉声卡结束）")
         else:
-            print("\n🔔 长音已响 —— 现在开始说话（%.1f 秒）！" % self.args.duration)
+            for i in (3, 2, 1):
+                self.show(self.screens.busy(
+                    "准备录音…", "倒数 %d —— 待会儿听到长音就开始说" % i))
+                audio.beep(times=1, freq=800, duration=0.15, volume=0.5,
+                           device=out_dev)
+                time.sleep(0.85)
+
+            self.show(self.screens.listening(levels, hint=hint))
+            audio.beep(times=1, freq=1400, duration=0.35, volume=0.6,
+                       device=out_dev)
+            if self.args.silence_stop and self.args.silence_stop > 0:
+                print("\n🔔 长音已响 —— 现在开始说话"
+                      "（说完停顿 %.1f 秒自动结束，最多 %.1f 秒）！"
+                      % (self.args.silence_stop, self.args.duration))
+            else:
+                print("\n🔔 长音已响 —— 现在开始说话（%.1f 秒）！"
+                      % self.args.duration)
 
         def on_level(ratio, progress):
             levels.append(ratio)
@@ -574,7 +594,7 @@ class App(object):
         out = self.args.voice_out
         sf.write(out, samples, audio.RECORD_RATE)
         print("🔊 播放变声结果…")
-        if not self._ensure_output():
+        if not self._ensure_output((result.text or "").strip()):
             print("  ⚠️ 声卡一直没插回来，跳过播放")
             return
         audio.play_wav(out, device=audio.find_alsa_device("output"))
@@ -602,7 +622,7 @@ class App(object):
         self.show(self.screens.speech_progress(text, 1.0, title="合成完成"))
         time.sleep(0.4)
 
-        if not self._ensure_output():
+        if not self._ensure_output(text):
             print("  ⚠️ 声卡一直没插回来，跳过播放")
             return
         audio.play_wav(wav, device=audio.find_alsa_device("output"))
