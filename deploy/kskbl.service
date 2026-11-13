@@ -24,8 +24,12 @@ ExecStartPre=/bin/sleep 8
 #                         否则自己的说话也会被判成静音，录 3 秒就结束。
 #                         环境特别吵（> -35 dBFS）时要降到 10~12。
 #   --speech-floor -35 说话判定的绝对下限 dBFS
+# 触发方式：
+#   --trigger usb   插上 USB 声卡开始一轮，拔下结束（当前使用）
+#   --trigger auto  自动循环，不用插拔（想改成无人值守时用这个）
 ExecStart=/home/radxa/proj/venv/bin/python -u src/kskbl/app.py \
-    --trigger auto \
+    --trigger usb \
+    --usb-id 0d8c:0014 \
     --gap 3 \
     --duration 15 \
     --silence-stop 3 \

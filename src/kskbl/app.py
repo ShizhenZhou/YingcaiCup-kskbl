@@ -185,22 +185,16 @@ class App(object):
                                              self.lcd.width, self.lcd.height))
 
         # ── 音频设备 ──
-        print("\n[2/4] 准备音频设备")
-        self.card = audio.find_usb_card_index()
-        if self.card is None:
-            raise SystemExit("❌ 找不到 USB 声卡")
-
-        audio.setup_mic_gain(self.card, gain=args.mic_gain)
-        audio.setup_speaker(self.card, volume=args.speaker_volume)
-
-        self.dev_in = audio.find_sounddevice_index("input")
-        if self.dev_in is None:
-            raise SystemExit("❌ 找不到 USB 声卡的录音设备")
-
-        self.recorder = audio.Recorder(device=self.dev_in, rate=audio.RECORD_RATE)
-        print("  ALSA 卡号 %d | 录音设备索引 %s | %d Hz 单声道"
-              % (self.card, self.dev_in, audio.RECORD_RATE))
-        print("  麦克风增益 %d/35，扬声器音量 %d/37" % (args.mic_gain, args.speaker_volume))
+        # USB 触发模式下声卡可能还没插，那就先不配，等插上再配。
+        self.card = None
+        self.dev_in = None
+        self.recorder = None
+        if args.trigger == "usb":
+            print("\n[2/4] 音频设备：USB 触发模式，等声卡插上后再配置")
+        else:
+            print("\n[2/4] 准备音频设备")
+            if not self.setup_audio():
+                raise SystemExit("❌ 找不到 USB 声卡")
 
         # ── AI 模型 ──
         print("\n[3/4] 加载语音识别模型")
@@ -231,6 +225,34 @@ class App(object):
         self.voice_label = args.voice
         self.switch_voice(args.voice)
 
+    # ── 音频设备 ───────────────────────────────────────────
+    def setup_audio(self):
+        """配置 USB 声卡（增益、音量、录音设备）。返回是否成功。
+
+        ⚠️ USB 触发模式下**每次插上都要重新调用** ——
+           ALSA 卡号和 sounddevice 索引每次插拔都可能变
+           （实测见过 card 3/4/5），不重新解析就会用错设备。
+        """
+        card = audio.find_usb_card_index()
+        if card is None:
+            return False
+
+        audio.setup_mic_gain(card, gain=self.args.mic_gain)
+        audio.setup_speaker(card, volume=self.args.speaker_volume)
+
+        dev_in = audio.find_sounddevice_index("input")
+        if dev_in is None:
+            return False
+
+        self.card = card
+        self.dev_in = dev_in
+        self.recorder = audio.Recorder(device=dev_in, rate=audio.RECORD_RATE)
+        print("  ALSA 卡号 %d | 录音设备索引 %s | %d Hz 单声道"
+              % (card, dev_in, audio.RECORD_RATE))
+        print("  麦克风增益 %d/35，扬声器音量 %d/37"
+              % (self.args.mic_gain, self.args.speaker_volume))
+        return True
+
     # ── 屏幕 ───────────────────────────────────────────────
     def show(self, buf):
         self.lcd.show(buf)
@@ -250,6 +272,9 @@ class App(object):
         if self.args.trigger == "jack":
             return self._wait_jack()
 
+        if self.args.trigger == "usb":
+            return self._wait_usb()
+
         if self.args.trigger == "enter":
             try:
                 input("\n按回车开始一轮（Ctrl+C 退出）… ")
@@ -258,6 +283,69 @@ class App(object):
                 return False
 
         raise SystemExit("未知触发方式：%s" % self.args.trigger)
+
+    # ── USB 声卡插拔触发 ───────────────────────────────────
+    def _usb_card_present(self):
+        """USB 声卡是否插着。
+
+        按 **VID:PID** 认设备（默认 0d8c:0014），不用卡号 ——
+        ALSA 卡号每次插拔都可能变（见过 3/4/5），按编号找必然出错。
+        """
+        import glob
+
+        want = (self.args.usb_id or "").strip().lower()
+        if not want:
+            return False
+        for path in glob.glob("/proc/asound/card*/usbid"):
+            try:
+                with open(path, "r") as f:
+                    if f.read().strip().lower() == want:
+                        return True
+            except OSError:
+                continue
+        return False
+
+    def _wait_usb(self):
+        """等 USB 声卡插入 —— 插上就开工。
+
+        这比按 3.5mm 插头可靠：USB 声卡芯片本身不上报麦克风插拔，
+        但整块声卡的插拔是 USB 层面的事件，100% 能检测到。
+        """
+        if self._usb_card_present():
+            self.show(self.screens.plain("声卡已插着"))
+            print("\n⚠️  USB 声卡已经插着，请先拔下来再插上（每轮以插拔为触发）")
+            while self._usb_card_present():
+                time.sleep(0.4)
+
+        print("\n🔌 等待 USB 声卡插入…")
+        self.show(self.screens.plain("请插上声卡"))
+        while not self._usb_card_present():
+            time.sleep(0.4)
+
+        # USB 音频设备枚举需要一点时间，轮询等它就绪再配置
+        print("  ✅ 检测到 USB 声卡，等待设备就绪…")
+        for _ in range(20):
+            time.sleep(0.4)
+            try:
+                if self.setup_audio():
+                    print("  ✅ 音频设备就绪，开始这一轮")
+                    return True
+            except Exception as exc:  # noqa: BLE001
+                print("     （设备还没就绪：%s）" % exc)
+        print("  ⚠️ 声卡已插入但一直配置失败，跳过这一轮")
+        return False
+
+    def after_round(self):
+        """一轮结束后的收尾。USB 触发模式下要等用户把声卡拔掉。"""
+        if self.args.trigger != "usb":
+            return
+
+        if self._usb_card_present():
+            last = getattr(self, "last_text", "")
+            self.show(self.screens.plain("请拔下声卡"))
+            print("  请拔下 USB 声卡（拔下后再插上开始下一轮）")
+            while self._usb_card_present():
+                time.sleep(0.3)
 
     def _wait_jack(self):
         """等 3.5mm 插孔插入（板子自己的 ES8316，card 3）
@@ -659,6 +747,9 @@ class App(object):
                     self.show_error("出错了", "%s: %s" % (type(exc).__name__, exc))
                     time.sleep(2.0)
 
+                # USB 触发模式下：等用户拔掉声卡，再准备下一轮
+                self.after_round()
+
                 # 回到待机，把上次识别的文字留在屏幕底部
                 last = getattr(self, "last_text", "")
                 self.show(self.screens.idle(
@@ -692,8 +783,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--trigger", default="auto",
-                    choices=["auto", "jack", "enter"],
-                    help="触发方式（默认 auto 自动循环）")
+                    choices=["auto", "jack", "usb", "enter"],
+                    help="触发方式（默认 auto 自动循环）。"
+                         "usb = 插上 USB 声卡开始一轮，拔下结束")
+    ap.add_argument("--usb-id", default="0d8c:0014",
+                    help="USB 声卡的 VID:PID（默认 0d8c:0014 = C-Media，绿联 30724）")
     ap.add_argument("--gap", type=float, default=1.0, help="auto 模式下每轮间隔秒数")
     ap.add_argument("--cycles", type=int, default=0, help="跑几轮后结束（0=一直跑）")
     ap.add_argument("--duration", type=float, default=15.0,
