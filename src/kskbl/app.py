@@ -309,6 +309,20 @@ class App(object):
         else:
             hint = "请说话，%d 秒…" % self.args.duration
 
+        # ── 先测环境噪声基线 ──
+        # ⚠️ 关键改进：VAD 如果只用固定阈值，环境一吵就永远判定"有人在说话"，
+        #    静音永远累计不起来，只能干等时长上限（实测在嘈杂环境里就是这样）。
+        #    所以每轮先安静录一小段，算出噪声有多吵，
+        #    之后的判定门限就是「噪声 + N dB」（自适应）。
+        noise_db = None
+        if self.args.silence_stop and self.args.silence_stop > 0:
+            self.show(self.screens.busy("校准环境噪音…", "保持安静 0.6 秒"))
+            calib = self.recorder.record(0.6, tick=0.05)
+            noise_db = audio.measure_noise_floor(calib, audio.RECORD_RATE)
+            need = max(noise_db + self.args.noise_margin, -40.0)
+            print("🎚  环境噪声基线 %.1f dBFS → 说话门限 %.1f dBFS（高 %.0f dB 才算说话）"
+                  % (noise_db, need, self.args.noise_margin))
+
         # ── 给用户明确的「开始说话」信号 ──
         # 3 声倒数的嘀（800Hz），最后一声长音（1400Hz）就是"开始说"。
         # 没有提示音的话，人根本不知道什么时候该说（实测踩过这个坑：
@@ -337,7 +351,8 @@ class App(object):
         t0 = time.time()
         samples = self.recorder.record(
             self.args.duration, level_cb=on_level, tick=0.12,
-            silence_stop=self.args.silence_stop or None)
+            silence_stop=self.args.silence_stop or None,
+            noise_dbfs=noise_db, margin_db=self.args.noise_margin)
         info = getattr(self.recorder, "last_info", {})
 
         # 两声低音 = 录音结束
@@ -684,6 +699,9 @@ def main():
                     help="最长录音时长（秒）。有 --silence-stop 时是上限")
     ap.add_argument("--silence-stop", type=float, default=3.0,
                     help="说完后停顿多少秒自动结束录音（默认 3；0 = 关闭，用固定时长）")
+    ap.add_argument("--noise-margin", type=float, default=8.0,
+                    help="比环境噪声高多少 dB 才算「在说话」（默认 8）。"
+                         "环境吵就调大，说话轻就调小")
     ap.add_argument("--result-hold", type=float, default=1.5,
                     help="识别结果显示停留时间（秒）")
     ap.add_argument("--reply", default="echo", choices=["echo", "fixed"],

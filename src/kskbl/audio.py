@@ -219,6 +219,34 @@ def trim_silence(x, rate, threshold=0.01, keep=0.3):
     return x[start:end]
 
 
+def measure_noise_floor(samples, rate, block_ms=50.0, floor_db=-90.0):
+    """从一段录音里估计环境噪声基线（dBFS）。
+
+    用**分块 RMS 的中位数**而不是整段 RMS：
+    如果校准期间有人突然咳嗽/关门，整段均值会被拉高，
+    中位数则基本不受影响。
+
+    返回 dBFS（负数，越小越安静）。
+    """
+    x = np.asarray(samples, dtype=np.float32)
+    if x.size == 0:
+        return floor_db
+
+    n = max(1, int(rate * block_ms / 1000.0))
+    blocks = x.size // n
+    if blocks < 2:
+        rms = float(np.sqrt(np.mean(x * x)))
+        return (20.0 * np.log10(rms)) if rms > 0 else floor_db
+
+    vals = []
+    for i in range(blocks):
+        seg = x[i * n:(i + 1) * n]
+        rms = float(np.sqrt(np.mean(seg * seg)))
+        vals.append((20.0 * np.log10(rms)) if rms > 0 else floor_db)
+
+    return float(np.median(vals))
+
+
 class Recorder(object):
     """阻塞录音。支持两种结束方式：
 
@@ -239,7 +267,8 @@ class Recorder(object):
         self.last_info = {}
 
     def record(self, seconds, level_cb=None, tick=0.08, silence_stop=None,
-               speech_threshold=0.18, min_speech=0.2):
+               speech_threshold=0.18, min_speech=0.2,
+               noise_dbfs=None, margin_db=8.0, abs_speech_dbfs=-40.0):
         """录一段音频，返回 float32 单声道数组。
 
         参数
@@ -247,13 +276,25 @@ class Recorder(object):
             level_cb         : level_cb(level_ratio, progress) 每 tick 调一次
             tick             : 轮询间隔（秒）
             silence_stop     : 连续静音超过这么多秒就停；None = 录满固定时长
-            speech_threshold : 电平比例超过这个值算"有人在说话"（0~1）
-            min_speech       : 至少累积这么久的有声段，才开始计静音，
+            speech_threshold : **固定阈值**模式下的判定门限（0~1）
+            min_speech       : 至少累积这么久的有声段才开始计静音，
                                否则开头还没开口就会被判定成"静音"
+            noise_dbfs       : **自适应模式**的环境噪声基线（dBFS）。
+                               给了这个参数就不再使用 speech_threshold，
+                               改用「噪声 + margin_db」判定说话。
+                               ⚠️ 环境吵的时候这是唯一可行的办法 ——
+                               固定阈值会被噪声一路顶住，永远等不到静音。
+            margin_db        : 比噪声高多少 dB 才算"在说话"（默认 8）
+            abs_speech_dbfs  : 绝对下限。噪声极安静时防止把呼吸/底噪当说话
         """
         frames = int(seconds * self.rate)
         if frames <= 0:
             return np.zeros(0, dtype=np.float32)
+
+        # 自适应模式下先算出说话门限（dBFS）
+        speech_dbfs = None
+        if noise_dbfs is not None:
+            speech_dbfs = max(float(noise_dbfs) + margin_db, abs_speech_dbfs)
 
         buf = np.zeros(frames, dtype=np.float32)
         state = {"pos": 0, "level": 0.0}
@@ -292,8 +333,17 @@ class Recorder(object):
                     reason = "已录满 %.1f 秒上限" % seconds
                     break
 
-                ratio = level_to_ratio(state["level"])
-                if ratio >= speech_threshold:
+                lvl = state["level"]
+                ratio = level_to_ratio(lvl)
+
+                # 判定"这一帧是不是有人在说话"
+                if speech_dbfs is not None:
+                    db = (20.0 * np.log10(lvl)) if lvl > 0 else -90.0
+                    is_speech = db > speech_dbfs
+                else:
+                    is_speech = ratio >= speech_threshold
+
+                if is_speech:
                     spoken += tick
                     silent = 0.0
                 elif spoken >= min_speech:
@@ -316,6 +366,8 @@ class Recorder(object):
             "reason": reason,
             "spoken": spoken,
             "silent": silent,
+            "noise_dbfs": noise_dbfs,
+            "speech_dbfs": speech_dbfs,
         }
         return buf[:n]
 

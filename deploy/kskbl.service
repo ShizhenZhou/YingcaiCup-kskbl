@@ -15,13 +15,16 @@ WorkingDirectory=/home/radxa/proj/kskbl
 # 如果还是太早，程序会因为找不到声卡退出，systemd 5 秒后自动重启，最终能起来。
 ExecStartPre=/bin/sleep 8
 
-# 自动循环：待机 → 倒数 → 录音（静音 3 秒自动停）→ 识别 → 变声 → 播放
-# --duration 是最长录音时长（保险），--silence-stop 3 是说完停顿 3 秒就结束
+# 自动循环：待机 → 校准噪声 → 倒数 → 录音（静音 3 秒自动停）→ 识别 → 变声 → 播放
+#   --duration 15      最长录音时长（保险）
+#   --silence-stop 3   说完停顿 3 秒自动结束
+#   --noise-margin 8   比环境噪声高 8 dB 才算「在说话」（自适应门限，环境吵也不会一直录）
 ExecStart=/home/radxa/proj/venv/bin/python -u src/kskbl/app.py \
     --trigger auto \
     --gap 3 \
     --duration 15 \
     --silence-stop 3 \
+    --noise-margin 8 \
     --mic-gain 28 \
     --voice wawa
 
